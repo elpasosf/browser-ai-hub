@@ -578,3 +578,96 @@ textarea:disabled {
   background: rgba(45, 212, 191, 0.04);
   line-height: 1.35;
 }
+
+/* Simple / Advanced */
+.mode-switch {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  gap: 2px;
+}
+
+.mode-btn {
+  font-family: var(--font);
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background var(--ease), color var(--ease);
+}
+
+.mode-btn.active {
+  background: var(--accent);
+  color: #04201c;
+}
+
+.simple-lead {
+  font-size: 0.88rem;
+  color: var(--text-dim);
+  margin-bottom: 0.85rem;
+  line-height: 1.4;
+}
+
+.auto-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.7rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.22);
+  margin-bottom: 0.75rem;
+}
+
+.auto-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.auto-row strong {
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+  font-size: 0.78rem;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+body[data-ui-mode="simple"] .advanced-only {
+  display: none !important;
+}
+
+body[data-ui-mode="advanced"] .simple-only {
+  display: none !important;
+}
+
+#advanced-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+#advanced-panels[hidden] {
+  display: none !important;
+}
+
+.shell {
+  /* chat gets more room in simple mode */
+}
+
+body[data-ui-mode="simple"] .chat-box {
+  max-height: min(68vh, 640px);
+  min-height: 360px;
+}
+

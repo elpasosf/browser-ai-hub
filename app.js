@@ -1,12 +1,37 @@
 /**
- * Browser AI Hub — real local LLM via WebLLM (MLC) + WebGPU worker.
+ * Browser AI Hub — WebLLM local chat with Simple (auto) + Advanced modes.
  */
 import { CreateWebWorkerMLCEngine } from 'https://esm.run/@mlc-ai/web-llm';
 
-const PREFS_KEY = 'bah.webllm.prefs.v1';
+const PREFS_KEY = 'bah.webllm.prefs.v2';
 const CHAT_KEY = 'bah.webllm.chat.v1';
 const MAX_LOG = 220;
-const MAX_HISTORY = 16;
+const MAX_HISTORY = 12;
+
+const MODELS = {
+  tiny: {
+    id: 'SmolLM2-360M-Instruct-q4f16_1-MLC',
+    label: 'SmolLM2 360M (fastest)',
+  },
+  small: {
+    id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
+    label: 'Qwen2.5 0.5B (balanced)',
+  },
+  medium: {
+    id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',
+    label: 'Llama 3.2 1B (smarter)',
+  },
+  large: {
+    id: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+    label: 'Qwen2.5 1.5B (best quality)',
+  },
+};
+
+const LENGTH_TOKENS = {
+  short: 256,
+  normal: 1024,
+  long: 2048,
+};
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -26,8 +51,14 @@ const els = {
   loadPct: $('load-pct'),
   progressBar: $('progress-bar'),
   progressTrack: $('progress-track'),
+  simpleStatus: $('simple-status-label'),
+  simplePct: $('simple-load-pct'),
+  simpleBar: $('simple-progress-bar'),
   modelSelect: $('model-select'),
   systemPrompt: $('system-prompt'),
+  lengthSelect: $('length-select'),
+  configMode: $('config-mode'),
+  maxTokensOverride: $('max-tokens-override'),
   bootBtn: $('boot-btn'),
   resetBtn: $('reset-btn'),
   clearCacheBtn: $('clear-cache-btn'),
@@ -41,15 +72,23 @@ const els = {
   clearChat: $('clear-chat'),
   providerList: $('provider-list'),
   modelBadge: $('model-badge'),
+  autoModelLabel: $('auto-model-label'),
+  autoLengthLabel: $('auto-length-label'),
+  autoCacheLabel: $('auto-cache-label'),
+  advancedPanels: $('advanced-panels'),
+  modeSimple: $('mode-simple'),
+  modeAdvanced: $('mode-advanced'),
 };
 
 /** @type {import('@mlc-ai/web-llm').MLCEngineInterface | null} */
 let engine = null;
 let booted = false;
 let generating = false;
-let chatMessages = []; // {role, content}
+let chatMessages = [];
 let tokenCount = 0;
 let genStart = 0;
+let uiMode = 'simple';
+let recommended = MODELS.medium;
 
 function loadPrefs() {
   try {
@@ -76,6 +115,7 @@ function saveChat() {
 }
 
 function writeLog(message, level = 'info') {
+  if (!els.logBox) return;
   const row = document.createElement('div');
   row.className = `log-line log-${level}`;
   const time = document.createElement('span');
@@ -92,15 +132,16 @@ function writeLog(message, level = 'info') {
 function setStatus(text, tone = 'idle') {
   els.headerStatus.textContent = text;
   els.pillStatus.dataset.tone = tone;
+  if (els.simpleStatus) els.simpleStatus.textContent = text;
 }
 
 function setBackendPill(name, tone = 'ok') {
-  els.pillBackend.textContent = `Backend: ${name}`;
+  els.pillBackend.textContent = `GPU: ${name}`;
   els.pillBackend.dataset.tone = tone;
 }
 
 function setProvider(id, text, active = false) {
-  const li = els.providerList.querySelector(`[data-id="${id}"]`);
+  const li = els.providerList?.querySelector(`[data-id="${id}"]`);
   if (!li) return;
   li.querySelector('.prov-state').textContent = text;
   li.classList.toggle('active', active);
@@ -108,10 +149,14 @@ function setProvider(id, text, active = false) {
 
 function updateProgress(percent, label) {
   const p = Math.max(0, Math.min(100, Math.round(percent)));
-  els.progressBar.style.width = `${p}%`;
-  els.loadPct.textContent = `${p}%`;
-  els.progressTrack.setAttribute('aria-valuenow', String(p));
-  if (label) els.loadLabel.textContent = label;
+  const apply = (bar, pctEl, labelEl) => {
+    if (bar) bar.style.width = `${p}%`;
+    if (pctEl) pctEl.textContent = `${p}%`;
+    if (labelEl && label) labelEl.textContent = label;
+  };
+  apply(els.progressBar, els.loadPct, els.loadLabel);
+  apply(els.simpleBar, els.simplePct, els.simpleStatus);
+  els.progressTrack?.setAttribute('aria-valuenow', String(p));
 }
 
 function appendMsg(role, text, meta) {
@@ -129,23 +174,64 @@ function appendMsg(role, text, meta) {
   return div;
 }
 
-function contextBudget() {
+/** Auto-pick model from device memory / mobile */
+function autoSelectModel() {
   const mem = navigator.deviceMemory || 8;
-  if (mem <= 4) return { label: 'Strict · 512 ctx', maxTokens: 128 };
-  if (mem <= 8) return { label: 'Balanced · 1k ctx', maxTokens: 256 };
-  return { label: 'Full · 2k+ ctx', maxTokens: 512 };
+  const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  if (mobile || mem <= 4) recommended = MODELS.tiny;
+  else if (mem <= 8) recommended = MODELS.small;
+  else if (mem <= 16) recommended = MODELS.medium;
+  else recommended = MODELS.large;
+  return recommended;
+}
+
+function resolveMaxTokens() {
+  const override = Number(els.maxTokensOverride?.value || 0);
+  if (override > 0) return override;
+  const len = els.lengthSelect?.value || 'normal';
+  return LENGTH_TOKENS[len] || LENGTH_TOKENS.normal;
+}
+
+function syncAutoLabels() {
+  const rec = autoSelectModel();
+  if (els.autoModelLabel) els.autoModelLabel.textContent = rec.label;
+  const len = els.lengthSelect?.value || 'normal';
+  const labels = {
+    short: 'Short (~256 tokens)',
+    normal: 'Normal (~1024 tokens)',
+    long: 'Long (~2048 tokens)',
+  };
+  if (els.autoLengthLabel) els.autoLengthLabel.textContent = labels[len] || labels.normal;
+  if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'This browser only';
+  if (els.oom) els.oom.textContent = `${resolveMaxTokens()} max tokens`;
+
+  // In Auto config, keep select aligned with recommendation
+  if ((els.configMode?.value || 'auto') === 'auto') {
+    els.modelSelect.value = rec.id;
+  }
+}
+
+function setUiMode(mode) {
+  uiMode = mode === 'advanced' ? 'advanced' : 'simple';
+  document.body.dataset.uiMode = uiMode;
+  els.modeSimple?.classList.toggle('active', uiMode === 'simple');
+  els.modeAdvanced?.classList.toggle('active', uiMode === 'advanced');
+  if (els.advancedPanels) els.advancedPanels.hidden = uiMode !== 'advanced';
+  savePrefs({ uiMode });
 }
 
 async function probeWebGPU() {
-  els.threads.textContent = `${navigator.hardwareConcurrency || 4} cores`;
-  els.memory.textContent = navigator.deviceMemory ? `~${navigator.deviceMemory} GB` : 'Unknown';
-  els.oom.textContent = contextBudget().label;
+  if (els.threads) els.threads.textContent = `${navigator.hardwareConcurrency || 4} cores`;
+  if (els.memory) {
+    els.memory.textContent = navigator.deviceMemory ? `~${navigator.deviceMemory} GB` : 'Unknown';
+  }
+  syncAutoLabels();
 
   if (!('gpu' in navigator)) {
-    els.gpu.textContent = 'Unavailable';
+    if (els.gpu) els.gpu.textContent = 'Unavailable';
     setProvider('webgpu', 'Not supported', false);
-    setBackendPill('NONE', 'error');
-    writeLog('WebGPU missing. Use Chrome/Edge 113+ on a GPU-capable device.', 'error');
+    setBackendPill('Needed', 'error');
+    writeLog('WebGPU missing. Use Chrome or Edge.', 'error');
     els.bootBtn.disabled = true;
     return false;
   }
@@ -153,10 +239,9 @@ async function probeWebGPU() {
   try {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) {
-      els.gpu.textContent = 'No adapter';
+      if (els.gpu) els.gpu.textContent = 'No adapter';
       setProvider('webgpu', 'No adapter', false);
-      setBackendPill('NONE', 'error');
-      writeLog('WebGPU adapter not found. Update GPU drivers / try another browser.', 'error');
+      setBackendPill('Needed', 'error');
       els.bootBtn.disabled = true;
       return false;
     }
@@ -169,14 +254,13 @@ async function probeWebGPU() {
     } catch {
       /* optional */
     }
-    els.gpu.textContent = detail;
+    if (els.gpu) els.gpu.textContent = detail;
     setProvider('webgpu', detail, true);
-    setBackendPill('WebGPU', 'ok');
+    setBackendPill('Ready', 'ok');
     writeLog(`WebGPU ready · ${detail}`, 'success');
     return true;
   } catch (err) {
-    els.gpu.textContent = 'Error';
-    setProvider('webgpu', err.message, false);
+    if (els.gpu) els.gpu.textContent = 'Error';
     writeLog(`WebGPU probe failed: ${err.message}`, 'error');
     els.bootBtn.disabled = true;
     return false;
@@ -186,34 +270,53 @@ async function probeWebGPU() {
 function onInitProgress(report) {
   const pct = (report.progress ?? 0) * 100;
   const text = report.text || 'Loading model…';
-  updateProgress(pct, text);
-  els.telCache.textContent = text.length > 48 ? `${text.slice(0, 48)}…` : text;
-  setStatus(pct >= 100 ? 'Warming kernels' : 'Downloading / caching', 'busy');
-  // Throttle log spam: only milestone-ish updates
-  if (pct === 0 || pct >= 99 || Math.round(pct) % 10 === 0) {
+  const friendly = /cache|Cached|Fetch cache/i.test(text)
+    ? 'Loading from your browser cache…'
+    : /download|Fetch|Loading/i.test(text)
+      ? text
+      : text;
+  updateProgress(pct, friendly);
+  if (els.telCache) {
+    els.telCache.textContent = text.length > 48 ? `${text.slice(0, 48)}…` : text;
+  }
+  setStatus(pct >= 100 ? 'Almost ready…' : /cache/i.test(text) ? 'Loading from cache' : 'Downloading model', 'busy');
+  if (pct === 0 || pct >= 99 || Math.round(pct) % 15 === 0) {
     writeLog(text, pct >= 99 ? 'success' : 'info');
   }
+}
+
+function selectedModelId() {
+  if ((els.configMode?.value || 'auto') === 'auto') {
+    return autoSelectModel().id;
+  }
+  return els.modelSelect.value;
 }
 
 async function loadLLM() {
   const ok = await probeWebGPU();
   if (!ok) return;
 
-  const modelId = els.modelSelect.value;
-  savePrefs({ modelId, system: els.systemPrompt.value });
+  const modelId = selectedModelId();
+  els.modelSelect.value = modelId;
+  savePrefs({
+    modelId,
+    system: els.systemPrompt.value,
+    length: els.lengthSelect.value,
+    configMode: els.configMode?.value || 'auto',
+    maxTokensOverride: els.maxTokensOverride?.value || '0',
+  });
 
   els.bootBtn.disabled = true;
   els.modelSelect.disabled = true;
   els.systemPrompt.disabled = true;
   els.resetBtn.disabled = true;
-  setStatus('Loading local LLM', 'busy');
-  updateProgress(1, 'Spawning WebLLM worker…');
+  setStatus('Starting…', 'busy');
+  updateProgress(2, 'Starting AI engine…');
   setProvider('worker', 'Starting', true);
-  writeLog(`Loading WebLLM model: ${modelId}`, 'info');
-  writeLog('First run downloads weights into Cache API (can take several minutes).', 'warn');
+  writeLog(`Loading: ${modelId}`, 'info');
+  writeLog('First visit downloads weights into THIS browser. Later visits reuse Cache API (not GitHub).', 'warn');
 
   try {
-    // Unload previous engine if any
     if (engine) {
       try {
         await engine.unload();
@@ -230,54 +333,53 @@ async function loadLLM() {
     );
 
     booted = true;
-    els.modelBadge.textContent = modelId.replace(/-MLC.*$/, '');
-    updateProgress(100, 'Local LLM ready');
+    if (els.modelBadge) els.modelBadge.textContent = modelId.replace(/-MLC.*$/, '');
+    updateProgress(100, 'Ready — start chatting');
     setStatus('Ready', 'ok');
     setProvider('worker', 'Running', true);
-    setProvider('webgpu', els.gpu.textContent || 'Active', true);
-    setBackendPill('WebGPU', 'ok');
+    setBackendPill('Active', 'ok');
     els.promptInput.disabled = false;
     els.sendBtn.disabled = false;
     els.resetBtn.disabled = false;
-    els.clearCacheBtn.disabled = false;
-    els.bootBtn.textContent = 'Reload model';
+    if (els.clearCacheBtn) els.clearCacheBtn.disabled = false;
+    els.bootBtn.textContent = uiMode === 'simple' ? 'Restart AI' : 'Reload model';
     els.bootBtn.disabled = false;
     els.modelSelect.disabled = false;
     els.systemPrompt.disabled = false;
-    els.promptInput.placeholder = 'Chat with your local LLM…';
+    els.promptInput.placeholder = 'Ask anything…';
     els.promptInput.focus();
 
     try {
       const stats = await engine.runtimeStatsText();
-      els.telBytes.textContent = String(stats).slice(0, 42);
+      if (els.telBytes) els.telBytes.textContent = String(stats).slice(0, 42);
       writeLog(`Runtime: ${stats}`, 'success');
     } catch {
-      els.telBytes.textContent = 'WebGPU · cached';
+      if (els.telBytes) els.telBytes.textContent = 'WebGPU · browser cache';
     }
 
-    const hello =
-      `Local LLM loaded: ${modelId}. Inference runs on your GPU via WebGPU in a Web Worker. Weights stay in this browser's cache.`;
-    appendMsg('assistant', hello);
-    writeLog('Pipeline ready — ask anything.', 'success');
+    appendMsg(
+      'assistant',
+      `Ready. Using ${modelId.split('-').slice(0, 3).join(' ')}. Reply length: ${els.lengthSelect.value} (up to ${resolveMaxTokens()} tokens). Ask for long essays with length set to Long if needed.`
+    );
+    writeLog('Local LLM ready.', 'success');
   } catch (err) {
     writeLog(`Load failed: ${err.message || err}`, 'error');
-    writeLog(
-      'Tip: pick a smaller model (Qwen 0.5B / SmolLM2 360M), free VRAM, use Chrome/Edge, and serve over http://localhost (not file://).',
-      'warn'
-    );
-    setStatus('Load failed', 'error');
+    writeLog('Tip: switch to Advanced → smaller model, or close other GPU apps.', 'warn');
+    setStatus('Couldn’t start', 'error');
     setProvider('worker', 'Error', false);
     els.bootBtn.disabled = false;
     els.modelSelect.disabled = false;
     els.systemPrompt.disabled = false;
-    els.bootBtn.textContent = 'Retry load';
+    els.bootBtn.textContent = 'Try again';
     engine = null;
     booted = false;
   }
 }
 
 function buildMessages() {
-  const system = els.systemPrompt.value.trim() || 'You are a helpful assistant.';
+  const system =
+    els.systemPrompt.value.trim() ||
+    'You are a helpful assistant. Give complete answers unless asked to be brief.';
   const history = chatMessages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-MAX_HISTORY)
@@ -302,48 +404,63 @@ async function sendPrompt(ev) {
   els.promptInput.disabled = true;
   const bubble = appendMsg('assistant', '');
   bubble.classList.add('streaming');
-  setStatus('Generating', 'busy');
-  els.telTps.textContent = '…';
-  els.telLatency.textContent = '…';
+  setStatus('Writing…', 'busy');
 
   tokenCount = 0;
   genStart = performance.now();
   let reply = '';
-  const budget = contextBudget();
+  let finishReason = null;
+  const maxTokens = resolveMaxTokens();
 
   try {
     const chunks = await engine.chat.completions.create({
       messages: buildMessages(),
       stream: true,
       stream_options: { include_usage: true },
-      max_tokens: budget.maxTokens,
+      max_tokens: maxTokens,
       temperature: 0.7,
       top_p: 0.95,
     });
 
     for await (const chunk of chunks) {
-      const delta = chunk.choices?.[0]?.delta?.content || '';
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta?.content || '';
+      if (choice?.finish_reason) finishReason = choice.finish_reason;
       if (delta) {
         reply += delta;
         tokenCount += 1;
         bubble.textContent = reply;
         els.chat.scrollTop = els.chat.scrollHeight;
         const elapsed = (performance.now() - genStart) / 1000;
-        if (elapsed > 0) els.telTps.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
+        if (elapsed > 0 && els.telTps) {
+          els.telTps.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
+        }
       }
-      if (chunk.usage) {
-        els.telSpeed.textContent = `prompt ${chunk.usage.prompt_tokens || '?'} · out ${
+      if (chunk.usage && els.telSpeed) {
+        els.telSpeed.textContent = `in ${chunk.usage.prompt_tokens || '?'} · out ${
           chunk.usage.completion_tokens || '?'
         }`;
       }
     }
 
     bubble.classList.remove('streaming');
+
+    if (finishReason === 'length') {
+      writeLog(
+        `Stopped at max length (${maxTokens} tokens). Set reply length to Long, or type “continue”.`,
+        'warn'
+      );
+    }
+
     const latencyMs = Math.round(performance.now() - genStart);
     const tps = latencyMs > 0 ? (tokenCount / (latencyMs / 1000)).toFixed(1) : '0';
-    els.telLatency.textContent = `${latencyMs} ms`;
-    els.telTps.textContent = `${tps} tok/s`;
-    const meta = `WebLLM · ${els.modelSelect.value.split('-')[0]} · ${latencyMs} ms · ${tps} tok/s`;
+    if (els.telLatency) els.telLatency.textContent = `${latencyMs} ms`;
+    if (els.telTps) els.telTps.textContent = `${tps} tok/s`;
+    const meta =
+      finishReason === 'length'
+        ? `Cut off at ${maxTokens} tokens — choose Long or type “continue” · ${tps} tok/s`
+        : `${finishReason || 'stop'} · ≤${maxTokens} tok · ${latencyMs} ms · ${tps} tok/s`;
+    bubble.textContent = reply || '(empty)';
     const m = document.createElement('span');
     m.className = 'msg-meta';
     m.textContent = meta;
@@ -352,14 +469,7 @@ async function sendPrompt(ev) {
     chatMessages.push({ role: 'assistant', content: reply || '(empty)' });
     saveChat();
     setStatus('Ready', 'ok');
-    writeLog(`Generation done · ${tokenCount} chunks · ${tps} tok/s · ${latencyMs} ms`, 'success');
-
-    try {
-      const stats = await engine.runtimeStatsText();
-      els.telBytes.textContent = String(stats).slice(0, 42);
-    } catch {
-      /* ignore */
-    }
+    writeLog(`Done · reason=${finishReason || 'stop'} · ${tps} tok/s`, 'success');
   } catch (err) {
     bubble.classList.remove('streaming');
     bubble.textContent = `Error: ${err.message || err}`;
@@ -378,14 +488,14 @@ async function abortGen() {
   if (!engine) return;
   try {
     await engine.interruptGenerate();
-    writeLog('Interrupt requested', 'warn');
+    writeLog('Stopped generation', 'warn');
   } catch (err) {
-    writeLog(`Interrupt failed: ${err.message}`, 'warn');
+    writeLog(`Stop failed: ${err.message}`, 'warn');
   }
 }
 
 async function unloadLLM() {
-  writeLog('Unloading engine from GPU memory…', 'warn');
+  writeLog('Freeing GPU memory…', 'warn');
   try {
     if (engine) await engine.unload();
   } catch {
@@ -399,47 +509,69 @@ async function unloadLLM() {
   els.abortBtn.disabled = true;
   els.resetBtn.disabled = true;
   els.bootBtn.disabled = false;
-  els.bootBtn.textContent = 'Load local LLM';
-  els.modelBadge.textContent = '—';
-  updateProgress(0, 'Standby');
+  els.bootBtn.textContent = uiMode === 'simple' ? 'Start AI' : 'Load local LLM';
+  if (els.modelBadge) els.modelBadge.textContent = '—';
+  updateProgress(0, 'Ready when you are');
   setStatus('Idle', 'idle');
   setProvider('worker', 'Idle', false);
-  appendMsg('assistant', 'Model unloaded from GPU. Browser Cache API may still hold weights for fast reload.');
+  appendMsg(
+    'assistant',
+    'AI stopped and GPU memory freed. The model file usually stays in your browser cache for a fast restart.'
+  );
 }
 
 function clearChat() {
   chatMessages = [];
   saveChat();
   els.chat.innerHTML = '';
-  appendMsg(
-    'assistant',
-    'Chat cleared (local only). Model weights in Cache API are unchanged.'
-  );
+  appendMsg('assistant', 'New chat started. Cached model weights are unchanged.');
 }
 
-// --- wire up ---
+// --- UI mode ---
+els.modeSimple?.addEventListener('click', () => setUiMode('simple'));
+els.modeAdvanced?.addEventListener('click', () => setUiMode('advanced'));
+
 els.bootBtn.addEventListener('click', () => loadLLM());
 els.resetBtn.addEventListener('click', () => unloadLLM());
-els.clearCacheBtn.addEventListener('click', () => unloadLLM());
+els.clearCacheBtn?.addEventListener('click', () => unloadLLM());
 els.promptForm.addEventListener('submit', sendPrompt);
 els.abortBtn.addEventListener('click', () => abortGen());
-els.clearLog.addEventListener('click', () => {
-  els.logBox.innerHTML = '';
+els.clearLog?.addEventListener('click', () => {
+  if (els.logBox) els.logBox.innerHTML = '';
   writeLog('Console cleared', 'info');
 });
 els.clearChat.addEventListener('click', () => clearChat());
-els.modelSelect.addEventListener('change', () => savePrefs({ modelId: els.modelSelect.value }));
+els.lengthSelect?.addEventListener('change', () => {
+  savePrefs({ length: els.lengthSelect.value });
+  syncAutoLabels();
+});
+els.configMode?.addEventListener('change', () => {
+  savePrefs({ configMode: els.configMode.value });
+  syncAutoLabels();
+  els.modelSelect.disabled = els.configMode.value === 'auto';
+});
+els.modelSelect?.addEventListener('change', () => savePrefs({ modelId: els.modelSelect.value }));
+els.maxTokensOverride?.addEventListener('change', () => {
+  savePrefs({ maxTokensOverride: els.maxTokensOverride.value });
+  syncAutoLabels();
+});
 
 window.addEventListener('unhandledrejection', (e) => {
   e.preventDefault();
   writeLog(`Unhandled: ${e.reason?.message || e.reason}`, 'error');
-  setStatus('Error trapped', 'error');
+  setStatus('Error', 'error');
 });
 
-// restore prefs / chat
+// restore
 const prefs = loadPrefs();
+if (prefs.length) els.lengthSelect.value = prefs.length;
+if (prefs.configMode) els.configMode.value = prefs.configMode;
+if (prefs.maxTokensOverride) els.maxTokensOverride.value = prefs.maxTokensOverride;
 if (prefs.modelId) els.modelSelect.value = prefs.modelId;
 if (prefs.system) els.systemPrompt.value = prefs.system;
+els.modelSelect.disabled = (els.configMode?.value || 'auto') === 'auto';
+setUiMode(prefs.uiMode || 'simple');
+
 const prior = loadChat();
 if (prior.length) {
   chatMessages = prior;
@@ -454,7 +586,7 @@ if ('serviceWorker' in navigator) {
 }
 
 requestAnimationFrame(() => {
-  writeLog('Browser AI Hub · WebLLM local LLM runtime', 'info');
-  writeLog('Serve via http://localhost (npx serve .) — file:// will fail.', 'warn');
+  writeLog('Browser AI Hub ready', 'info');
+  syncAutoLabels();
   probeWebGPU();
 });
