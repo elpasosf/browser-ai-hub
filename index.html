@@ -3,14 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Browser AI Hub — on-device inference with WebGPU / WASM / Worker. No installer. Private by default." />
+  <meta name="description" content="Browser AI Hub — real local LLM in your browser via WebLLM + WebGPU. No installer." />
   <meta name="theme-color" content="#0a1018" />
-  <title>Browser AI Hub</title>
+  <title>Browser AI Hub — Local LLM</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <link rel="preconnect" href="https://esm.run" crossorigin />
   <link rel="preconnect" href="https://huggingface.co" crossorigin />
-  <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -21,11 +20,11 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <div>
           <h1>Browser AI Hub</h1>
-          <p class="brand-sub">Real on-device AI · WebGPU → WASM → CPU · no installer</p>
+          <p class="brand-sub">Real local LLM · WebLLM + WebGPU · weights cached in-browser</p>
         </div>
       </div>
       <div class="topbar-meta">
-        <span class="pill" id="pill-privacy" data-tone="ok">On-device privacy</span>
+        <span class="pill" id="pill-privacy" data-tone="ok">On-device LLM</span>
         <span class="pill" id="pill-backend" data-tone="idle">Backend: —</span>
         <span class="pill" id="pill-status" data-tone="idle">
           <span class="live-dot"></span>
@@ -48,11 +47,11 @@
               <span class="spec-v" id="spec-memory">—</span>
             </div>
             <div class="spec">
-              <span class="spec-k">Thread allocation</span>
-              <span class="spec-v" id="spec-alloc">—</span>
+              <span class="spec-k">WebGPU</span>
+              <span class="spec-v" id="spec-gpu">Detecting…</span>
             </div>
             <div class="spec">
-              <span class="spec-k">OOM profile</span>
+              <span class="spec-k">Context budget</span>
               <span class="spec-v" id="spec-oom">—</span>
             </div>
           </div>
@@ -62,8 +61,8 @@
           <h2>Execution providers</h2>
           <ul class="providers" id="provider-list">
             <li data-id="webgpu"><span class="prov-name">WebGPU</span><span class="prov-state">…</span></li>
-            <li data-id="wasm"><span class="prov-name">WASM SIMD</span><span class="prov-state">…</span></li>
-            <li data-id="cpu"><span class="prov-name">CPU worker</span><span class="prov-state">…</span></li>
+            <li data-id="wasm"><span class="prov-name">WASM (N/A for WebLLM)</span><span class="prov-state">WebGPU required</span></li>
+            <li data-id="worker"><span class="prov-name">LLM worker</span><span class="prov-state">Idle</span></li>
           </ul>
         </section>
 
@@ -71,11 +70,11 @@
           <h2>Telemetry</h2>
           <div class="telemetry">
             <div class="tel-row"><span>Active model</span><strong id="model-badge">—</strong></div>
-            <div class="tel-row"><span>Cache status</span><strong id="tel-cache">scanning…</strong></div>
-            <div class="tel-row"><span>Download speed</span><strong id="tel-speed">0.00 MB/s</strong></div>
-            <div class="tel-row"><span>Bytes transferred</span><strong id="tel-bytes">0 / 0</strong></div>
+            <div class="tel-row"><span>Load progress</span><strong id="tel-cache">—</strong></div>
+            <div class="tel-row"><span>Prefill / decode</span><strong id="tel-speed">—</strong></div>
             <div class="tel-row"><span>Token throughput</span><strong id="tel-tps">0.0 tok/s</strong></div>
             <div class="tel-row"><span>Latency</span><strong id="tel-latency">—</strong></div>
+            <div class="tel-row"><span>Runtime stats</span><strong id="tel-bytes">—</strong></div>
           </div>
           <div class="progress-block">
             <div class="progress-meta">
@@ -89,30 +88,29 @@
         </section>
 
         <section class="panel">
-          <h2>Pipeline</h2>
+          <h2>Local LLM pipeline</h2>
           <label class="field">
-            <span>Backend preference</span>
-            <select id="backend-select">
-              <option value="auto">Auto-detect (recommended)</option>
-              <option value="webgpu">WebGPU</option>
-              <option value="wasm">WASM + SIMD</option>
-              <option value="cpu">Vanilla CPU worker</option>
+            <span>Model (downloaded once, then cached)</span>
+            <select id="model-select">
+              <option value="Qwen2.5-0.5B-Instruct-q4f16_1-MLC">Qwen2.5 0.5B Instruct (smallest, ~0.4 GB)</option>
+              <option value="SmolLM2-360M-Instruct-q4f16_1-MLC">SmolLM2 360M Instruct (~0.3 GB)</option>
+              <option value="TinyLlama-1.1B-Chat-v1.0-q4f16_1-MLC">TinyLlama 1.1B Chat (~0.7 GB)</option>
+              <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC" selected>Llama 3.2 1B Instruct (~0.8 GB)</option>
+              <option value="Qwen2.5-1.5B-Instruct-q4f16_1-MLC">Qwen2.5 1.5B Instruct (~1.1 GB)</option>
+              <option value="Phi-3.5-mini-instruct-q4f16_1-MLC-1k">Phi-3.5 Mini Instruct 1k (~2.3 GB)</option>
             </select>
           </label>
           <label class="field">
-            <span>Model</span>
-            <select id="model-select">
-              <option value="Xenova/LaMini-Flan-T5-77M">LaMini-Flan-T5-77M (fast)</option>
-              <option value="Xenova/flan-t5-small">Flan-T5 Small</option>
-            </select>
+            <span>System prompt</span>
+            <input type="text" id="system-prompt" value="You are a helpful assistant running fully locally in the user's browser." />
           </label>
           <div class="btn-row">
-            <button type="button" class="btn primary" id="boot-btn">Boot AI pipeline</button>
-            <button type="button" class="btn ghost" id="reset-btn" disabled>Reset</button>
-            <button type="button" class="btn danger" id="clear-cache-btn" title="Clear cached model weights">Clear</button>
+            <button type="button" class="btn primary" id="boot-btn">Load local LLM</button>
+            <button type="button" class="btn ghost" id="reset-btn" disabled>Unload GPU</button>
+            <button type="button" class="btn danger" id="clear-cache-btn" title="Unload engine from GPU">Free VRAM</button>
           </div>
           <p class="privacy-note" style="margin-top:0.75rem">
-            Weights download once into Cache API / IndexedDB. Prompts run in a Web Worker on this device — no chat server.
+            This uses <strong>WebLLM (MLC)</strong> — a real chat LLM on WebGPU. First load downloads quantized weights into the browser Cache API; prompts never leave this device.
           </p>
         </section>
       </aside>
@@ -120,25 +118,26 @@
       <section class="workspace">
         <div class="panel chat-panel">
           <div class="chat-head">
-            <h2>Context workspace</h2>
+            <h2>Chat</h2>
             <button type="button" class="btn tiny" id="clear-chat">Clear chat</button>
           </div>
           <div class="chat-box" id="chat-viewport" aria-live="polite">
             <div class="msg ai">
-              This is the real Browser AI Hub (not a simulation). Boot the pipeline to stream quantized model weights into local cache, then chat fully on-device. First boot needs network; later boots are cache-hit fast.
+              Click <strong>Load local LLM</strong> to download a quantized model into this browser (one time). After that you can chat offline — real neural generation, not a stub.
+              WebGPU is required (Chrome / Edge recommended).
             </div>
           </div>
           <form class="input-row" id="prompt-form">
-            <input type="text" id="prompt-input" placeholder="Initialize pipeline first…" disabled autocomplete="off" />
+            <input type="text" id="prompt-input" placeholder="Load a local LLM first…" disabled autocomplete="off" />
             <button type="submit" class="btn primary" id="send-btn" disabled>Send</button>
-            <button type="button" class="btn ghost" id="abort-btn" disabled title="Abort generation">Stop</button>
+            <button type="button" class="btn ghost" id="abort-btn" disabled>Stop</button>
           </form>
-          <p class="hint">Tip: try “what is 10+10” or ask about privacy. Enter to send.</p>
+          <p class="hint">Try: “What is 10+10?” · “Explain WebGPU in one sentence.”</p>
         </div>
 
         <div class="panel console-panel">
           <div class="console-head">
-            <h2>Diagnostics console</h2>
+            <h2>Diagnostics</h2>
             <button type="button" class="btn tiny" id="clear-log">Clear</button>
           </div>
           <div class="console" id="log-box" role="log"></div>
