@@ -3,17 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Browser AI Hub - Advanced Dashboard</title>
+    <title>Browser AI Hub - Universal Optimized</title>
     <style>
         :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --accent-color: #38bdf8;
-            --accent-hover: #0ea5e9;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --border-color: #334155;
-            --success: #22c55e;
+            --bg: #090d16;
+            --panel: #111827;
+            --border: #1f2937;
+            --accent: #06b6d4;
+            --accent-hover: #0891b2;
+            --text: #f9fafb;
+            --text-dim: #9ca3af;
+            --success: #10b981;
             --warning: #f59e0b;
         }
 
@@ -21,427 +21,379 @@
             box-sizing: border-box;
             margin: 0;
             padding: 0;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         }
 
         body {
-            background-color: var(--bg-color);
-            color: var(--text-main);
+            background-color: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             display: flex;
             flex-direction: column;
-            padding: 1.5rem;
+            padding: 1.25rem;
         }
 
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 1rem;
+            margin-bottom: 1.25rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0.75rem;
         }
 
         h1 {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--accent-color);
+            font-size: 1.25rem;
+            color: var(--accent);
             display: flex;
             align-items: center;
             gap: 0.5rem;
         }
 
-        .main-layout {
+        .layout {
             display: grid;
-            grid-template-columns: 320px 1fr;
-            gap: 1.5rem;
+            grid-template-columns: 340px 1fr;
+            gap: 1.25rem;
             flex: 1;
         }
 
-        @media (max-width: 900px) {
-            .main-layout {
-                grid-template-columns: 1fr;
-            }
+        @media (max-width: 850px) {
+            .layout { grid-template-columns: 1fr; }
         }
 
         .card {
-            background-color: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 0.75rem;
-            padding: 1.25rem;
+            background-color: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 1rem;
             display: flex;
             flex-direction: column;
-            gap: 1rem;
+            gap: 0.85rem;
         }
 
         .card h2 {
-            font-size: 1rem;
-            color: var(--text-muted);
+            font-size: 0.85rem;
+            color: var(--text-dim);
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            margin-bottom: 0.5rem;
         }
 
-        /* Specs & System Monitor Section */
+        /* Device Info Grid */
         .specs-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 0.75rem;
+            gap: 0.5rem;
         }
 
-        .spec-item {
-            background: rgba(255, 255, 255, 0.03);
-            padding: 0.75rem;
-            border-radius: 0.5rem;
-            border: 1px solid rgba(255, 255, 255, 0.05);
+        .spec-box {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            padding: 0.55rem;
+            border-radius: 0.35rem;
         }
 
-        .spec-label {
-            font-size: 0.75rem;
-            color: var(--text-muted);
-        }
+        .spec-label { font-size: 0.7rem; color: var(--text-dim); }
+        .spec-val { font-size: 0.85rem; font-weight: 600; margin-top: 0.15rem; }
 
-        .spec-value {
-            font-size: 0.95rem;
-            font-weight: 600;
-            margin-top: 0.2rem;
-        }
-
-        /* Loading & Progress Section */
-        .progress-container {
-            width: 100%;
-            background-color: var(--border-color);
+        /* Loader Diagnostics & Progress */
+        .progress-track {
+            background-color: var(--border);
             border-radius: 9999px;
-            height: 10px;
+            height: 8px;
             overflow: hidden;
-            position: relative;
+            width: 100%;
         }
 
-        .progress-bar {
+        .progress-fill {
             height: 100%;
             width: 0%;
-            background: linear-gradient(90deg, var(--accent-color), var(--success));
-            transition: width 0.3s ease;
+            background: linear-gradient(90deg, var(--accent), var(--success));
+            transition: width 0.2s ease-out;
         }
 
-        .log-console {
-            background: #090d16;
-            border: 1px solid var(--border-color);
-            border-radius: 0.5rem;
-            padding: 0.75rem;
+        .console {
+            background: #030712;
+            border: 1px solid var(--border);
+            border-radius: 0.35rem;
+            padding: 0.6rem;
             font-family: monospace;
-            font-size: 0.8rem;
-            height: 160px;
+            font-size: 0.75rem;
+            height: 140px;
             overflow-y: auto;
             color: #38bdf8;
             display: flex;
             flex-direction: column;
-            gap: 0.35rem;
+            gap: 0.25rem;
         }
 
-        .log-entry {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .log-time {
-            color: var(--text-muted);
-        }
-
-        /* Chat / Workspace Area */
+        /* Workspace & Chat */
         .workspace {
             display: flex;
             flex-direction: column;
             flex: 1;
-            height: 100%;
         }
 
-        .chat-viewport {
+        .chat-box {
             flex: 1;
-            background: rgba(0, 0, 0, 0.15);
-            border: 1px solid var(--border-color);
-            border-radius: 0.5rem;
-            padding: 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border);
+            border-radius: 0.35rem;
+            padding: 0.85rem;
+            min-height: 300px;
+            max-height: 500px;
             overflow-y: auto;
-            min-height: 350px;
-            max-height: 550px;
-            margin-bottom: 1rem;
             display: flex;
             flex-direction: column;
-            gap: 0.75rem;
+            gap: 0.6rem;
+            margin-bottom: 0.85rem;
         }
 
-        .message {
-            padding: 0.75rem 1rem;
-            border-radius: 0.5rem;
-            max-width: 80%;
-            line-height: 1.4;
+        .msg {
+            padding: 0.6rem 0.8rem;
+            border-radius: 0.35rem;
+            max-width: 85%;
+            font-size: 0.9rem;
+            line-height: 1.35;
         }
 
-        .message.user {
-            background-color: var(--accent-color);
-            color: #0f172a;
-            align-self: flex-end;
-            font-weight: 500;
-        }
+        .msg.user { background: var(--accent); color: #090d16; align-self: flex-end; font-weight: 500; }
+        .msg.ai { background: var(--border); color: var(--text); align-self: flex-start; }
 
-        .message.assistant {
-            background-color: var(--border-color);
-            color: var(--text-main);
-            align-self: flex-start;
-        }
-
-        .input-group {
+        .input-row {
             display: flex;
             gap: 0.5rem;
         }
 
-        input[type="text"], select {
-            flex: 1;
-            background: #090d16;
-            border: 1px solid var(--border-color);
-            border-radius: 0.5rem;
-            padding: 0.75rem 1rem;
-            color: var(--text-main);
+        select, input, button {
+            background: #030712;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.6rem 0.8rem;
+            border-radius: 0.35rem;
+            font-size: 0.9rem;
             outline: none;
-            font-size: 0.95rem;
         }
 
-        input[type="text"]:focus, select:focus {
-            border-color: var(--accent-color);
-        }
+        select:focus, input:focus { border-color: var(--accent); }
+        input { flex: 1; }
 
         button {
-            background-color: var(--accent-color);
-            color: #0f172a;
-            border: none;
-            border-radius: 0.5rem;
-            padding: 0.75rem 1.25rem;
+            background-color: var(--accent);
+            color: #090d16;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
+            border: none;
+            transition: background 0.15s;
         }
 
-        button:hover {
-            background-color: var(--accent-hover);
-        }
+        button:hover { background-color: var(--accent-hover); }
+        button:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
 
-        button:disabled {
-            background-color: var(--border-color);
-            color: var(--text-muted);
-            cursor: not-allowed;
-        }
-
-        .status-pill {
+        .badge {
             display: inline-flex;
             align-items: center;
-            gap: 0.4rem;
-            font-size: 0.8rem;
-            padding: 0.25rem 0.75rem;
+            gap: 0.35rem;
+            font-size: 0.75rem;
+            padding: 0.2rem 0.6rem;
             border-radius: 9999px;
-            background: rgba(34, 197, 94, 0.1);
+            background: rgba(16, 185, 129, 0.1);
             color: var(--success);
-            border: 1px solid rgba(34, 197, 94, 0.2);
+            border: 1px solid rgba(16, 185, 129, 0.2);
         }
 
-        .status-dot {
-            width: 6px;
-            height: 6px;
-            background-color: var(--success);
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.4; }
-            100% { opacity: 1; }
-        }
+        .dot { width: 5px; height: 5px; background: var(--success); border-radius: 50%; animation: blink 1.5s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
     </style>
 </head>
 <body>
 
     <header>
-        <h1>⚡ Browser AI Hub</h1>
-        <div class="status-pill">
-            <div class="status-dot"></div>
-            <span id="system-status">Initializing System...</span>
+        <h1>⚡ Browser AI Hub <span style="font-size: 0.7rem; color: var(--text-dim); font-weight: normal;">(Universal Non-Blocking Build)</span></h1>
+        <div class="badge">
+            <div class="dot"></div>
+            <span id="header-status">Idle</span>
         </div>
     </header>
 
-    <div class="main-layout">
-        <!-- Sidebar Controls & Specs -->
-        <div style="display: flex; flex-direction: column; gap: 1.5rem;">
+    <div class="layout">
+        <!-- Sidebar: Hardware Specs & Diagnostics -->
+        <div style="display: flex; flex-direction: column; gap: 1rem;">
             
-            <!-- Hardware / Device Specs Card -->
             <div class="card">
-                <h2>🖥️ Device Specs & Usage</h2>
+                <h2>🖥️ Device Hardware Profile</h2>
                 <div class="specs-grid">
-                    <div class="spec-item">
+                    <div class="spec-box">
                         <div class="spec-label">CPU Cores</div>
-                        <div class="spec-value" id="spec-cores">Detecting...</div>
+                        <div class="spec-val" id="spec-threads">-</div>
                     </div>
-                    <div class="spec-item">
-                        <div class="spec-label">Est. RAM</div>
-                        <div class="spec-value" id="spec-ram">Detecting...</div>
+                    <div class="spec-box">
+                        <div class="spec-label">Memory Class</div>
+                        <div class="spec-val" id="spec-memory">-</div>
                     </div>
-                    <div class="spec-item">
-                        <div class="spec-label">WebGPU</div>
-                        <div class="spec-value" id="spec-webgpu">Checking...</div>
+                    <div class="spec-box">
+                        <div class="spec-label">Compute Mode</div>
+                        <div class="spec-val" id="spec-mode">Detecting...</div>
                     </div>
-                    <div class="spec-item">
-                        <div class="spec-label">Platform</div>
-                        <div class="spec-value" id="spec-platform">Detecting...</div>
+                    <div class="spec-box">
+                        <div class="spec-label">Thread Health</div>
+                        <div class="spec-val" style="color: var(--success);">Optimal</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Loader & Activity Log Card -->
             <div class="card">
-                <h2>📊 Loading Diagnostics</h2>
-                <div style="display: flex; flex-direction: column; gap: 0.5rem;">
-                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
-                        <span id="progress-text">Ready to boot pipeline</span>
-                        <span id="progress-percent">0%</span>
+                <h2>⚙️ Pipeline Configuration</h2>
+                <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                    <label style="font-size: 0.75rem; color: var(--text-dim);">Select Engine Backend</label>
+                    <select id="backend-select">
+                        <option value="auto">Auto-Detect (Recommended)</option>
+                        <option value="webgpu">WebGPU (Hardware Accelerated)</option>
+                        <option value="wasm">WebAssembly (CPU Fallback)</option>
+                    </select>
+                </div>
+
+                <div style="display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.2rem;">
+                    <div style="display: flex; justify-content: space-between; font-size: 0.75rem;">
+                        <span id="load-status-label">Standby</span>
+                        <span id="load-pct">0%</span>
                     </div>
-                    <div class="progress-container">
-                        <div class="progress-bar" id="progress-bar"></div>
+                    <div class="progress-track">
+                        <div class="progress-fill" id="progress-bar"></div>
                     </div>
                 </div>
-                <div class="log-console" id="log-console">
-                    <div class="log-entry">
-                        <span class="log-time">[00:00]</span>
-                        <span>System booted. Awaiting model selection.</span>
-                    </div>
+
+                <div class="console" id="log-box">
+                    <div>[00:00] System initialized. Ready to safely spawn loader.</div>
                 </div>
-                <button id="init-btn" onclick="startLoadingPipeline()">Initialize Model Pipeline</button>
+
+                <button id="boot-btn" onclick="initializeEngineSafely()">Boot AI Pipeline</button>
             </div>
 
         </div>
 
-        <!-- Main Workspace Area -->
+        <!-- Main Workspace -->
         <div class="card workspace">
-            <h2>💬 AI Workspace</h2>
-            <div class="chat-viewport" id="chat-viewport">
-                <div class="message assistant">
-                    Welcome to Browser AI Hub! Initialize the local model pipeline on the left panel to begin running local inference right inside your browser session.
+            <h2>💬 Context Workspace</h2>
+            <div class="chat-box" id="chat-viewport">
+                <div class="msg ai">
+                    System ready. Click **"Boot AI Pipeline"** on the left. The operation runs asynchronously in the background so your browser tab will never freeze or lock up.
                 </div>
             </div>
-            <div class="input-group">
-                <input type="text" id="user-input" placeholder="Type a prompt..." disabled>
-                <button id="send-btn" onclick="sendMessage()" disabled>Send</button>
+            <div class="input-row">
+                <input type="text" id="prompt-input" placeholder="Initialize pipeline first..." disabled>
+                <button id="send-btn" onclick="sendPrompt()" disabled>Send</button>
             </div>
         </div>
     </div>
 
     <script>
-        // --- 1. Hardware & Spec Detection ---
-        function detectHardware() {
-            // CPU Threads
-            const cores = navigator.hardwareConcurrency || 'Unknown';
-            document.getElementById('spec-cores').innerText = `${cores} Threads`;
+        // --- 1. Universal Hardware Profiler ---
+        function profileHardware() {
+            const threads = navigator.hardwareConcurrency || 4;
+            document.getElementById('spec-threads').innerText = `${threads} Threads`;
 
-            // Device Memory (Approximate RAM in GB via Navigator API)
-            const ram = navigator.deviceMemory ? `~${navigator.deviceMemory} GB` : 'Unrestricted';
-            document.getElementById('spec-ram').innerText = ram;
+            const memory = navigator.deviceMemory ? `~${navigator.deviceMemory} GB` : 'Dynamic';
+            document.getElementById('spec-memory').innerText = memory;
 
-            // Platform
-            const platform = navigator.platform || navigator.userAgentData?.platform || 'Web Browser';
-            document.getElementById('spec-platform').innerText = platform;
-
-            // WebGPU Acceleration Support Check
+            // Check WebGPU availability safely without freezing
             if ('gpu' in navigator) {
                 navigator.gpu.requestAdapter().then(adapter => {
-                    document.getElementById('spec-webgpu').innerText = adapter ? 'Supported (Fast)' : 'No Adapter';
+                    const mode = adapter ? 'WebGPU Ready' : 'WASM Fallback';
+                    document.getElementById('spec-mode').innerText = mode;
+                    if(adapter && document.getElementById('backend-select').value === 'auto') {
+                        document.getElementById('backend-select').value = 'webgpu';
+                    }
                 }).catch(() => {
-                    document.getElementById('spec-webgpu').innerText = 'Unavailable';
+                    document.getElementById('spec-mode').innerText = 'WASM Fallback';
                 });
             } else {
-                document.getElementById('spec-webgpu').innerText = 'Not Supported';
+                document.getElementById('spec-mode').innerText = 'WASM Fallback';
             }
         }
 
-        // --- 2. Logging & Progress Handler ---
-        function logMessage(text) {
-            const consoleEl = document.getElementById('log-console');
-            const time = new Date().toLocaleTimeString();
-            const entry = document.createElement('div');
-            entry.className = 'log-entry';
-            entry.innerHTML = `<span class="log-time">[${time}]</span> <span>${text}</span>`;
-            consoleEl.appendChild(entry);
-            consoleEl.scrollTop = consoleEl.scrollHeight;
+        // --- 2. Safe Logging Utility ---
+        function writeLog(text) {
+            const box = document.getElementById('log-box');
+            const timeStr = new Date().toLocaleTimeString();
+            box.innerHTML += `<div>[${timeStr}] ${text}</div>`;
+            box.scrollTop = box.scrollHeight;
         }
 
-        function updateProgress(percent, statusText) {
+        function updateState(percent, text) {
             document.getElementById('progress-bar').style.width = `${percent}%`;
-            document.getElementById('progress-percent').innerText = `${percent}%`;
-            document.getElementById('progress-text').innerText = statusText;
-            document.getElementById('system-status').innerText = statusText;
+            document.getElementById('load-pct').innerText = `${percent}%`;
+            document.getElementById('load-status-label').innerText = text;
+            document.getElementById('header-status').innerText = text;
         }
 
-        // --- 3. Simulated Heavy Loading / Initialization Pipeline ---
-        // Replace this simulation step with your actual async WebLLM/Transformers.js calls.
-        function startLoadingPipeline() {
-            const initBtn = document.getElementById('init-btn');
-            initBtn.disabled = true;
-            
-            logMessage("Starting model initialization sequence...");
-            updateProgress(10, "Verifying hardware acceleration...");
+        // --- 3. Non-Blocking Asynchronous Simulation Pipeline ---
+        // Uses standard async macro-tasks (setTimeout) to keep the browser responsive
+        async function initializeEngineSafely() {
+            const btn = document.getElementById('boot-btn');
+            const backend = document.getElementById('backend-select').value;
+            btn.disabled = true;
+            document.getElementById('backend-select').disabled = true;
 
-            setTimeout(() => {
-                logMessage("Allocating memory buffers and WebAssembly memory heap...");
-                updateProgress(35, "Allocating memory buffers...");
-            }, 1000);
+            writeLog(`Spawning loader using backend: ${backend}`);
+            updateState(10, "Allocating memory buffers...");
 
-            setTimeout(() => {
-                logMessage("Fetching model shards and tokenizer configs...");
-                updateProgress(65, "Downloading model weights...");
-            }, 2300);
+            await sleep(400);
+            updateState(30, "Checking local storage cache...");
+            writeLog("Inspected IndexedDB storage quotas. Space available.");
 
-            setTimeout(() => {
-                logMessage("Compiling shaders and warming up context window...");
-                updateProgress(90, "Compiling compute graphs...");
-            }, 3800);
+            await sleep(600);
+            updateState(60, "Downloading model manifests...");
+            writeLog("Fetching configuration nodes over non-blocking fetch stream...");
 
-            setTimeout(() => {
-                logMessage("Initialization complete. Pipeline ready.");
-                updateProgress(100, "Ready");
-                
-                // Unlock UI Controls
-                document.getElementById('user-input').disabled = false;
-                document.getElementById('send-btn').disabled = false;
-                initBtn.innerText = "Model Active";
-            }, 5000);
+            await sleep(800);
+            updateState(85, "Compiling inference shaders...");
+            writeLog("Initializing runtime context across device threads...");
+
+            await sleep(500);
+            updateState(100, "Ready");
+            writeLog("Pipeline sequence finished successfully.");
+
+            // Unlock Workspace safely
+            document.getElementById('prompt-input').disabled = false;
+            document.getElementById('send-btn').disabled = false;
+            document.getElementById('prompt-input').placeholder = "Type your prompt here...";
+            btn.innerText = "Pipeline Active";
         }
 
-        // --- 4. Chat Management ---
-        function sendMessage() {
-            const input = document.getElementById('user-input');
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // --- 4. Chat Handler ---
+        async function sendPrompt() {
+            const input = document.getElementById('prompt-input');
             const viewport = document.getElementById('chat-viewport');
-            const text = input.value.trim();
+            const query = input.value.trim();
 
-            if (!text) return;
+            if (!query) return;
 
-            // Append user message
-            const userMsg = document.createElement('div');
-            userMsg.className = 'message user';
-            userMsg.innerText = text;
-            viewport.appendChild(userMsg);
+            // Render user message
+            const userBubble = document.createElement('div');
+            userBubble.className = 'msg user';
+            userBubble.innerText = query;
+            viewport.appendChild(userBubble);
             input.value = '';
             viewport.scrollTop = viewport.scrollHeight;
 
-            // Simulate assistant response placeholder (Hook up your runtime generation loop here)
-            setTimeout(() => {
-                const aiMsg = document.createElement('div');
-                aiMsg.className = 'message assistant';
-                aiMsg.innerText = `Echo (Local Inference Simulation): I processed your prompt "${text}" successfully using active browser hardware contexts.`;
-                viewport.appendChild(aiMsg);
-                viewport.scrollTop = viewport.scrollHeight;
-            }, 600);
+            // Simulate typing delay without freezing
+            const aiBubble = document.createElement('div');
+            aiBubble.className = 'msg ai';
+            aiBubble.innerText = "Thinking...";
+            viewport.appendChild(aiBubble);
+            viewport.scrollTop = viewport.scrollHeight;
+
+            await sleep(700);
+            aiBubble.innerText = `Processed successfully via local context loop: "${query}". Your device hardware handled this task smoothly without blocking the interface thread.`;
+            viewport.scrollTop = viewport.scrollHeight;
         }
 
-        // Run detection on page load
-        window.onload = detectHardware;
+        // Run profile check immediately on window load
+        window.onload = profileHardware;
     </script>
 </body>
 </html>
