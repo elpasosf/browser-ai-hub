@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Browser AI Hub — crash-proof local inference with WebGPU / WASM / Worker fallback" />
+  <title>Browser AI Hub</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>Browser AI Hub</h1>
+          <p class="brand-sub">Zero-freeze local inference · WebGPU → WASM → CPU</p>
+        </div>
+      </div>
+      <div class="topbar-meta">
+        <span class="pill" id="pill-backend" data-tone="idle">Backend: —</span>
+        <span class="pill" id="pill-status" data-tone="idle">
+          <span class="live-dot"></span>
+          <span id="header-status">Idle</span>
+        </span>
+      </div>
+    </header>
+
+    <main class="shell">
+      <!-- Diagnostics column -->
+      <aside class="rail">
+        <section class="panel">
+          <h2>Device profile</h2>
+          <div class="specs">
+            <div class="spec">
+              <span class="spec-k">CPU threads</span>
+              <span class="spec-v" id="spec-threads">—</span>
+            </div>
+            <div class="spec">
+              <span class="spec-k">Device memory</span>
+              <span class="spec-v" id="spec-memory">—</span>
+            </div>
+            <div class="spec">
+              <span class="spec-k">Thread allocation</span>
+              <span class="spec-v" id="spec-alloc">—</span>
+            </div>
+            <div class="spec">
+              <span class="spec-k">OOM profile</span>
+              <span class="spec-v" id="spec-oom">—</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Execution providers</h2>
+          <ul class="providers" id="provider-list">
+            <li data-id="webgpu"><span class="prov-name">WebGPU</span><span class="prov-state">…</span></li>
+            <li data-id="wasm"><span class="prov-name">WASM SIMD</span><span class="prov-state">…</span></li>
+            <li data-id="cpu"><span class="prov-name">CPU worker</span><span class="prov-state">…</span></li>
+          </ul>
+        </section>
+
+        <section class="panel">
+          <h2>Telemetry</h2>
+          <div class="telemetry">
+            <div class="tel-row">
+              <span>Cache status</span>
+              <strong id="tel-cache">scanning…</strong>
+            </div>
+            <div class="tel-row">
+              <span>Download speed</span>
+              <strong id="tel-speed">0.00 MB/s</strong>
+            </div>
+            <div class="tel-row">
+              <span>Bytes transferred</span>
+              <strong id="tel-bytes">0 / 0</strong>
+            </div>
+            <div class="tel-row">
+              <span>Token throughput</span>
+              <strong id="tel-tps">0.0 tok/s</strong>
+            </div>
+          </div>
+
+          <div class="progress-block">
+            <div class="progress-meta">
+              <span id="load-status-label">Standby</span>
+              <span id="load-pct">0%</span>
+            </div>
+            <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
+              <div class="progress-fill" id="progress-bar"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel pipeline-panel">
+          <h2>Pipeline</h2>
+          <label class="field">
+            <span>Backend preference</span>
+            <select id="backend-select">
+              <option value="auto">Auto-detect (recommended)</option>
+              <option value="webgpu">WebGPU</option>
+              <option value="wasm">WASM + SIMD</option>
+              <option value="cpu">Vanilla CPU worker</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Model</span>
+            <select id="model-select">
+              <option value="Xenova/LaMini-Flan-T5-77M">LaMini-Flan-T5-77M (text2text)</option>
+              <option value="Xenova/flan-t5-small">Flan-T5 Small</option>
+            </select>
+          </label>
+          <div class="btn-row">
+            <button type="button" class="btn primary" id="boot-btn">Boot AI pipeline</button>
+            <button type="button" class="btn ghost" id="reset-btn" disabled>Reset</button>
+          </div>
+        </section>
+      </aside>
+
+      <!-- Workspace + console -->
+      <section class="workspace">
+        <div class="panel chat-panel">
+          <h2>Context workspace</h2>
+          <div class="chat-box" id="chat-viewport" aria-live="polite">
+            <div class="msg ai">
+              System ready. Boot the pipeline to download (or restore from cache) model weights
+              on a dedicated Web Worker. The UI thread stays free — no freezes, streamed progress,
+              automatic WebGPU → WASM → CPU fallback.
+            </div>
+          </div>
+          <form class="input-row" id="prompt-form">
+            <input
+              type="text"
+              id="prompt-input"
+              placeholder="Initialize pipeline first…"
+              disabled
+              autocomplete="off"
+            />
+            <button type="submit" class="btn primary" id="send-btn" disabled>Send</button>
+          </form>
+        </div>
+
+        <div class="panel console-panel">
+          <div class="console-head">
+            <h2>Diagnostics console</h2>
+            <button type="button" class="btn tiny" id="clear-log">Clear</button>
+          </div>
+          <div class="console" id="log-box" role="log"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module">
+    (() => {
+      'use strict';
+
+      // -----------------------------------------------------------------------
+      // Hardware profile (main thread — cheap probes only)
+      // -----------------------------------------------------------------------
+      const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+      const deviceProfile = {
+        hardwareConcurrency: navigator.hardwareConcurrency || 4,
+        deviceMemory: navigator.deviceMemory || null,
+        isMobile,
+        userAgent: navigator.userAgent,
+      };
+
+      const limitsHint = (() => {
+        const mem = deviceProfile.deviceMemory || 8;
+        if (isMobile || mem <= 2) return { label: 'Strict', maxNew: 48, ctx: 512 };
+        if (mem <= 4) return { label: 'Conservative', maxNew: 96, ctx: 1024 };
+        if (mem <= 8) return { label: 'Balanced', maxNew: 160, ctx: 2048 };
+        return { label: 'Full', maxNew: 256, ctx: 4096 };
+      })();
+
+      // -----------------------------------------------------------------------
+      // DOM refs
+      // -----------------------------------------------------------------------
+      const $ = (id) => document.getElementById(id);
+      const els = {
+        threads: $('spec-threads'),
+        memory: $('spec-memory'),
+        alloc: $('spec-alloc'),
+        oom: $('spec-oom'),
+        pillBackend: $('pill-backend'),
+        pillStatus: $('pill-status'),
+        headerStatus: $('header-status'),
+        telCache: $('tel-cache'),
+        telSpeed: $('tel-speed'),
+        telBytes: $('tel-bytes'),
+        telTps: $('tel-tps'),
+        loadLabel: $('load-status-label'),
+        loadPct: $('load-pct'),
+        progressBar: $('progress-bar'),
+        progressTrack: $('progress-track'),
+        backendSelect: $('backend-select'),
+        modelSelect: $('model-select'),
+        bootBtn: $('boot-btn'),
+        resetBtn: $('reset-btn'),
+        promptInput: $('prompt-input'),
+        sendBtn: $('send-btn'),
+        promptForm: $('prompt-form'),
+        chat: $('chat-viewport'),
+        logBox: $('log-box'),
+        clearLog: $('clear-log'),
+        providerList: $('provider-list'),
+      };
+
+      // -----------------------------------------------------------------------
+      // UI helpers
+      // -----------------------------------------------------------------------
+      function writeLog(message, level = 'info') {
+        const row = document.createElement('div');
+        row.className = `log-line log-${level}`;
+        const t = new Date().toLocaleTimeString();
+        row.innerHTML = `<span class="log-time">[${t}]</span> <span class="log-msg"></span>`;
+        row.querySelector('.log-msg').textContent = message;
+        els.logBox.appendChild(row);
+        els.logBox.scrollTop = els.logBox.scrollHeight;
+      }
+
+      function setStatus(text, tone = 'idle') {
+        els.headerStatus.textContent = text;
+        els.pillStatus.dataset.tone = tone;
+      }
+
+      function setBackendPill(name) {
+        els.pillBackend.textContent = `Backend: ${name || '—'}`;
+        const tone =
+          name === 'webgpu' ? 'ok' : name === 'wasm' ? 'warn' : name === 'cpu' ? 'idle' : 'idle';
+        els.pillBackend.dataset.tone = tone;
+      }
+
+      function updateProgress(percent, label) {
+        const p = Math.max(0, Math.min(100, percent | 0));
+        els.progressBar.style.width = `${p}%`;
+        els.loadPct.textContent = `${p}%`;
+        els.progressTrack.setAttribute('aria-valuenow', String(p));
+        if (label) els.loadLabel.textContent = label;
+      }
+
+      function setProviderState(id, text, active = false) {
+        const li = els.providerList.querySelector(`[data-id="${id}"]`);
+        if (!li) return;
+        li.querySelector('.prov-state').textContent = text;
+        li.classList.toggle('active', active);
+      }
+
+      function yieldToUI() {
+        return new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+      }
+
+      function appendMsg(role, text) {
+        const div = document.createElement('div');
+        div.className = `msg ${role}`;
+        div.textContent = text;
+        els.chat.appendChild(div);
+        els.chat.scrollTop = els.chat.scrollHeight;
+        return div;
+      }
+
+      // -----------------------------------------------------------------------
+      // Error boundary for unhandled rejections / errors
+      // -----------------------------------------------------------------------
+      window.addEventListener('unhandledrejection', (e) => {
+        e.preventDefault();
+        const msg = e.reason?.message || String(e.reason);
+        writeLog(`Unhandled rejection caught: ${msg}`, 'error');
+        writeLog('Tip: reboot with Auto backend or clear site storage if quota-related.', 'warn');
+        setStatus('Error trapped', 'error');
+      });
+
+      window.addEventListener('error', (e) => {
+        writeLog(`Runtime error: ${e.message}`, 'error');
+        setStatus('Error trapped', 'error');
+      });
+
+      // -----------------------------------------------------------------------
+      // Worker bridge
+      // -----------------------------------------------------------------------
+      let worker = null;
+      let reqSeq = 0;
+      const pending = new Map();
+      let booted = false;
+      let streamingBubble = null;
+
+      function ensureWorker() {
+        if (worker) return worker;
+        worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+
+        worker.onmessage = (ev) => onWorkerMessage(ev.data);
+        worker.onerror = (err) => {
+          writeLog(`Worker crash: ${err.message}`, 'error');
+          writeLog('Tip: serve over http(s), enable COOP/COEP for threads, retry Auto.', 'warn');
+          setStatus('Worker error', 'error');
+          els.bootBtn.disabled = false;
+        };
+        return worker;
+      }
+
+      function callWorker(type, payload = {}) {
+        const id = ++reqSeq;
+        return new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject, type });
+          ensureWorker().postMessage({ id, type, payload });
+        });
+      }
+
+      function onWorkerMessage(data) {
+        if (!data) return;
+
+        if (data.type === 'EVENT') {
+          handleEvent(data.channel, data.payload);
+          return;
+        }
+
+        const waiter = pending.get(data.id);
+        if (!waiter) return;
+        pending.delete(data.id);
+
+        if (data.type === 'ERROR') {
+          writeLog(data.payload?.message || 'Worker error', 'error');
+          if (data.payload?.tip) writeLog(`Tip: ${data.payload.tip}`, 'warn');
+          waiter.reject(new Error(data.payload?.message || 'Worker error'));
+          return;
+        }
+        waiter.resolve(data.payload);
+      }
+
+      function handleEvent(channel, payload) {
+        switch (channel) {
+          case 'log':
+            writeLog(payload.message, payload.level || 'info');
+            break;
+          case 'progress': {
+            const pct = payload.percent ?? 0;
+            const label = payload.cached
+              ? `Cache restore · ${payload.label || 'asset'}`
+              : payload.text || `Downloading ${payload.label || 'asset'}`;
+            updateProgress(pct, label);
+            if (payload.speedMBps != null) {
+              els.telSpeed.textContent = `${Number(payload.speedMBps).toFixed(2)} MB/s`;
+            }
+            if (payload.total || payload.loaded) {
+              els.telBytes.textContent = `${fmt(payload.loaded)} / ${fmt(payload.total || payload.loaded)}`;
+            }
+            setStatus(payload.cached ? 'Loading from cache' : 'Streaming weights', 'busy');
+            break;
+          }
+          case 'backends':
+            applyBackendReport(payload);
+            break;
+          case 'cache':
+            els.telCache.textContent = payload.cacheEntries
+              ? `${payload.cacheEntries} files · ${payload.cacheMB} MB`
+              : 'Cold (empty)';
+            break;
+          case 'limits':
+            els.oom.textContent = `${payload.maxNewTokens} tok · ctx ${payload.contextChars}`;
+            break;
+          case 'telemetry':
+            if (payload.threadsAllocated != null) {
+              els.alloc.textContent = `${payload.threadsAllocated} workers`;
+            }
+            break;
+          case 'stage':
+            setStatus(payload.message || payload.stage, 'busy');
+            updateProgress(
+              stagePercent(payload.stage),
+              payload.message || payload.stage
+            );
+            break;
+          case 'token':
+            if (streamingBubble) {
+              streamingBubble.textContent = payload.text || streamingBubble.textContent;
+              els.chat.scrollTop = els.chat.scrollHeight;
+            }
+            if (payload.tps != null) {
+              els.telTps.textContent = `${Number(payload.tps).toFixed(1)} tok/s`;
+            }
+            break;
+          case 'error':
+            writeLog(payload.message, 'error');
+            if (payload.tip) writeLog(`Tip: ${payload.tip}`, 'warn');
+            setStatus('Recoverable error', 'error');
+            break;
+          default:
+            break;
+        }
+      }
+
+      function stagePercent(stage) {
+        const map = {
+          shaders: 20,
+          download: 45,
+          compile: 70,
+          warmup: 88,
+          ready: 100,
+          generate: 100,
+          idle: 100,
+        };
+        return map[stage] ?? 50;
+      }
+
+      function applyBackendReport(r) {
+        setProviderState(
+          'webgpu',
+          r.webgpu?.available ? r.webgpu.detail || 'Ready' : r.webgpu?.detail || 'Unavailable',
+          r.selected === 'webgpu' || r.active === 'webgpu'
+        );
+        setProviderState(
+          'wasm',
+          r.wasm?.detail || 'Baseline',
+          r.selected === 'wasm' || r.active === 'wasm'
+        );
+        setProviderState(
+          'cpu',
+          r.cpu?.detail || 'Worker',
+          r.selected === 'cpu' || r.active === 'cpu'
+        );
+        const active = r.active || r.selected;
+        if (active) setBackendPill(active.toUpperCase());
+        if (r.demoted) writeLog(r.demoteReason || 'Backend demoted for memory safety', 'warn');
+      }
+
+      function fmt(n) {
+        if (!n) return '0 B';
+        const u = ['B', 'KB', 'MB', 'GB'];
+        let i = 0;
+        let v = n;
+        while (v >= 1024 && i < u.length - 1) {
+          v /= 1024;
+          i++;
+        }
+        return `${v.toFixed(i ? 2 : 0)} ${u[i]}`;
+      }
+
+      // -----------------------------------------------------------------------
+      // Init profile + probe (non-blocking)
+      // -----------------------------------------------------------------------
+      async function initProfile() {
+        els.threads.textContent = `${deviceProfile.hardwareConcurrency} cores`;
+        els.memory.textContent = deviceProfile.deviceMemory
+          ? `~${deviceProfile.deviceMemory} GB`
+          : 'Unknown';
+        els.oom.textContent = limitsHint.label;
+        els.alloc.textContent = 'Pending boot';
+        writeLog('Main thread online · spawning diagnostics worker', 'info');
+        await yieldToUI();
+
+        try {
+          ensureWorker();
+          await callWorker('PROFILE', deviceProfile);
+          const backends = await callWorker('PROBE_BACKENDS', {
+            preference: els.backendSelect.value,
+          });
+          applyBackendReport(backends);
+          const cache = await callWorker('CACHE_STATUS');
+          els.telCache.textContent = cache.cacheEntries
+            ? `${cache.cacheEntries} files · ${cache.cacheMB} MB`
+            : 'Cold (empty)';
+          writeLog(
+            `Probe complete · preferred ${backends.selected.toUpperCase()}`,
+            'success'
+          );
+          setStatus('Ready to boot', 'idle');
+        } catch (err) {
+          writeLog(`Probe failed: ${err.message}`, 'error');
+          setProviderState('cpu', 'Available', true);
+          setBackendPill('CPU');
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Boot / infer / reset
+      // -----------------------------------------------------------------------
+      async function boot() {
+        els.bootBtn.disabled = true;
+        els.backendSelect.disabled = true;
+        els.modelSelect.disabled = true;
+        els.resetBtn.disabled = true;
+        setStatus('Booting pipeline', 'busy');
+        updateProgress(5, 'Spawning worker loader…');
+        writeLog(`Boot requested · backend=${els.backendSelect.value}`, 'info');
+        await yieldToUI();
+
+        try {
+          ensureWorker();
+          await callWorker('PROFILE', deviceProfile);
+          const result = await callWorker('BOOT', {
+            backend: els.backendSelect.value,
+            modelId: els.modelSelect.value,
+          });
+
+          booted = true;
+          setBackendPill((result.backend || 'cpu').toUpperCase());
+          updateProgress(100, result.fallback ? 'Fallback engine ready' : 'Ready');
+          setStatus('Ready', 'ok');
+          els.promptInput.disabled = false;
+          els.sendBtn.disabled = false;
+          els.promptInput.placeholder = 'Ask the local model…';
+          els.promptInput.focus();
+          els.resetBtn.disabled = false;
+          els.bootBtn.textContent = 'Pipeline active';
+          if (result.cache) {
+            els.telCache.textContent = result.cache.cacheEntries
+              ? `${result.cache.cacheEntries} files · ${result.cache.cacheMB} MB`
+              : 'Warming';
+          }
+          appendMsg(
+            'ai',
+            result.fallback
+              ? 'Local fallback engine is active (CDN runtime unavailable). Inference still runs off the UI thread.'
+              : `Pipeline live on ${String(result.backend).toUpperCase()} · ${result.modelId}. Weights are cached for instant subsequent boots.`
+          );
+          writeLog('Pipeline sequence finished successfully', 'success');
+        } catch (err) {
+          writeLog(`Boot failed: ${err.message}`, 'error');
+          setStatus('Boot failed', 'error');
+          els.bootBtn.disabled = false;
+          els.backendSelect.disabled = false;
+          els.modelSelect.disabled = false;
+          els.bootBtn.textContent = 'Retry boot';
+        }
+      }
+
+      async function sendPrompt(ev) {
+        ev?.preventDefault?.();
+        if (!booted) return;
+        const query = els.promptInput.value.trim();
+        if (!query) return;
+
+        appendMsg('user', query);
+        els.promptInput.value = '';
+        els.sendBtn.disabled = true;
+        els.promptInput.disabled = true;
+        streamingBubble = appendMsg('ai', '…');
+        setStatus('Generating', 'busy');
+        els.telTps.textContent = '0.0 tok/s';
+
+        try {
+          const result = await callWorker('INFER', { prompt: query });
+          if (streamingBubble) {
+            streamingBubble.textContent = result.text || '(empty response)';
+          }
+          if (result.tps != null) {
+            els.telTps.textContent = `${Number(result.tps).toFixed(1)} tok/s`;
+          }
+          setStatus('Ready', 'ok');
+        } catch (err) {
+          if (streamingBubble) {
+            streamingBubble.textContent = `Error: ${err.message}`;
+          }
+          writeLog(`Inference error: ${err.message}`, 'error');
+          setStatus('Inference error', 'error');
+        } finally {
+          streamingBubble = null;
+          els.sendBtn.disabled = false;
+          els.promptInput.disabled = false;
+          els.promptInput.focus();
+        }
+      }
+
+      async function resetPipeline() {
+        writeLog('Resetting context & disposing weights…', 'warn');
+        try {
+          await callWorker('RESET');
+        } catch {
+          /* ignore */
+        }
+        booted = false;
+        els.promptInput.disabled = true;
+        els.sendBtn.disabled = true;
+        els.promptInput.placeholder = 'Initialize pipeline first…';
+        els.bootBtn.disabled = false;
+        els.backendSelect.disabled = false;
+        els.modelSelect.disabled = false;
+        els.resetBtn.disabled = true;
+        els.bootBtn.textContent = 'Boot AI pipeline';
+        updateProgress(0, 'Standby');
+        setStatus('Idle', 'idle');
+        appendMsg('ai', 'Context cleared. Memory dispose requested. Boot again when ready.');
+      }
+
+      // -----------------------------------------------------------------------
+      // Bindings
+      // -----------------------------------------------------------------------
+      els.bootBtn.addEventListener('click', () => {
+        boot().catch((e) => writeLog(e.message, 'error'));
+      });
+      els.resetBtn.addEventListener('click', () => {
+        resetPipeline().catch((e) => writeLog(e.message, 'error'));
+      });
+      els.promptForm.addEventListener('submit', sendPrompt);
+      els.clearLog.addEventListener('click', () => {
+        els.logBox.innerHTML = '';
+        writeLog('Console cleared', 'info');
+      });
+
+      // Kick off without blocking paint
+      requestAnimationFrame(() => {
+        writeLog('System initialized. Ready to safely spawn loader.', 'info');
+        initProfile();
+      });
+    })();
+  </script>
+</body>
+</html>
