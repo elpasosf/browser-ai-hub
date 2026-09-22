@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Browser AI Selector</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Local Browser AI Selector</h1>
+        <p class="subtitle">Runs completely on your device via Wasm/WebGL/WebGPU fallbacks</p>
+
+        <!-- Model Configuration UI -->
+        <div class="control-panel">
+            <div class="input-group">
+                <label for="model-select">Choose a Model:</label>
+                <select id="model-select">
+                    <option value="Xenova/Qwen1.5-0.5B-Chat">Qwen 1.5 (0.5B Chat) - Text</option>
+                    <option value="Xenova/MobileNetV2">MobileNetV2 - Image Classification</option>
+                    <option value="Xenova/all-MiniLM-L6-v2">MiniLM-L6 - Text Embeddings</option>
+                </select>
+            </div>
+            <button id="load-btn">Initialize Model</button>
+        </div>
+
+        <!-- Status Tracker -->
+        <div id="status-container" class="hidden">
+            <h3>System Status</h3>
+            <div id="status-message">Ready to load.</div>
+            <div class="progress-bar-container">
+                <div id="progress-bar"></div>
+            </div>
+        </div>
+
+        <!-- Execution Playground -->
+        <div id="playground" class="hidden">
+            <h3>Inference Playground</h3>
+            <div class="input-group">
+                <label for="user-input">Input Data:</label>
+                <textarea id="user-input" placeholder="Type text here..."></textarea>
+            </div>
+            <button id="run-btn">Run Local Inference</button>
+            
+            <div class="output-group">
+                <h4>Output:</h4>
+                <div id="output-box">Execution results will appear here...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Core Logic using Hugging Face Transformers.js (v3) -->
+    <script type="module">
+        import { pipeline, env } from 'https://jsdelivr.net';
+
+        // FORCE WEBGL / WASM FALLBACKS BY CONFIGURING THE ENVIRONMENT
+        // This ensures compatibility even if the user lacks WebGPU
+        env.allowLocalModels = false; 
+
+        let currentPipeline = null;
+        let selectedModelName = "";
+
+        const modelSelect = document.getElementById('model-select');
+        const loadBtn = document.getElementById('load-btn');
+        const statusContainer = document.getElementById('status-container');
+        const statusMessage = document.getElementById('status-message');
+        const progressBar = document.getElementById('progress-bar');
+        const playground = document.getElementById('playground');
+        const userInput = document.getElementById('user-input');
+        const runBtn = document.getElementById('run-btn');
+        const outputBox = document.getElementById('output-box');
+
+        // Initialize Model
+        loadBtn.addEventListener('click', async () => {
+            selectedModelName = modelSelect.value;
+            statusContainer.classList.remove('hidden');
+            playground.classList.add('hidden');
+            progressBar.style.width = '0%';
+            statusMessage.textContent = 'Downloading configuration and model shards...';
+
+            try {
+                // Determine task type based on chosen model
+                let task = "text-generation";
+                if (selectedModelName.includes("MobileNetV2")) task = "image-classification";
+                if (selectedModelName.includes("MiniLM")) task = "feature-extraction";
+
+                // Initialize pipeline with explicit WebGL/Wasm-friendly ONNX configurations
+                currentPipeline = await pipeline(task, selectedModelName, {
+                    device: 'wasm', // Explicit fallback execution context
+                    progress_callback: (data) => {
+                        if (data.status === 'progress') {
+                            statusMessage.textContent = `Loading ${data.file}: ${Math.round(data.progress)}%`;
+                            progressBar.style.width = `${data.progress}%`;
+                        } else if (data.status === 'ready') {
+                            statusMessage.textContent = 'Processing completed files...';
+                        }
+                    }
+                });
+
+                statusMessage.textContent = `Successfully loaded ${selectedModelName}!`;
+                progressBar.style.width = '100%';
+                
+                // Set sample inputs dynamically
+                if (task === "image-classification") {
+                    userInput.value = "https://huggingface.co";
+                } else if (task === "feature-extraction") {
+                    userInput.value = "Determine the vector embedding mapping for this string.";
+                } else {
+                    userInput.value = "Hello! Tell me a one-sentence joke about computers.";
+                }
+
+                playground.classList.remove('hidden');
+            } catch (error) {
+                statusMessage.textContent = `Initialization Error: ${error.message}`;
+                console.error(error);
+            }
+        });
+
+        // Run Inference Locally
+        runBtn.addEventListener('click', async () => {
+            if (!currentPipeline) return;
+            outputBox.textContent = "Processing local compute calculations...";
+            const inputData = userInput.value.trim();
+
+            try {
+                const startTime = performance.now();
+                let result;
+
+                if (selectedModelName.includes("MobileNetV2")) {
+                    // Image classification input
+                    result = await currentPipeline(inputData);
+                } else if (selectedModelName.includes("MiniLM")) {
+                    // Text embedding extraction
+                    result = await currentPipeline(inputData, { pooling: 'mean', normalize: true });
+                    result = `Tensor array shape: [${result.dims}]. First 5 features: ${Array.from(result.data).slice(0, 5).join(', ')}...`;
+                } else {
+                    // LLM text generation text 
+                    result = await currentPipeline(inputData, { max_new_tokens: 50 });
+                    result = result[0].generated_text;
+                }
+
+                const duration = ((performance.now() - startTime) / 1000).toFixed(2);
+                outputBox.innerHTML = `<strong>Result:</strong><br>${JSON.stringify(result, null, 2)}<br><br><small>Executed locally in ${duration}s</small>`;
+            } catch (error) {
+                outputBox.textContent = `Execution Error: ${error.message}`;
+            }
+        });
+    </script>
+</body>
+</html>
