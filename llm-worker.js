@@ -1,6 +1,5 @@
 /**
- * WebLLM engine worker — keeps GPU compile + inference off the UI thread.
- * Official handler from @mlc-ai/web-llm.
+ * WebLLM engine worker — off the UI thread.
  */
 import { WebWorkerMLCEngineHandler } from 'https://esm.run/@mlc-ai/web-llm';
 

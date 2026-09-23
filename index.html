@@ -3,17 +3,41 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Browser AI Hub — chat with a real local LLM in your browser. No installer. Private by default." />
+  <meta name="description" content="Browser AI Hub — temporary local LLM in your browser. Nothing saved." />
   <meta name="theme-color" content="#0a1018" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
   <title>Browser AI Hub</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="preconnect" href="https://esm.run" crossorigin />
-  <link rel="preconnect" href="https://huggingface.co" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=4" />
+  <script>
+    // Kill stale service workers + caches immediately (fixes mixed old/new UI)
+    (function () {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function (regs) {
+          regs.forEach(function (r) { r.unregister(); });
+        });
+      }
+      if (window.caches && caches.keys) {
+        caches.keys().then(function (keys) {
+          keys.forEach(function (k) {
+            if (/bah-|browser-ai|web-ai|shell/i.test(k)) caches.delete(k);
+          });
+        });
+      }
+      try {
+        ['bah.webllm.prefs.v1','bah.webllm.prefs.v2','bah.webllm.chat.v1','bah.prefs.v1'].forEach(function (k) {
+          localStorage.removeItem(k);
+          sessionStorage.removeItem(k);
+        });
+      } catch (e) {}
+    })();
+  </script>
 </head>
-<body>
+<body data-ui-mode="simple">
   <div class="app">
     <header class="topbar">
       <div class="brand">
@@ -25,8 +49,8 @@
       </div>
       <div class="topbar-meta">
         <div class="mode-switch" role="group" aria-label="UI mode">
-          <button type="button" class="mode-btn active" data-mode="simple" id="mode-simple">Simple</button>
-          <button type="button" class="mode-btn" data-mode="advanced" id="mode-advanced">Advanced</button>
+          <button type="button" class="mode-btn active" id="mode-simple">Simple</button>
+          <button type="button" class="mode-btn" id="mode-advanced">Advanced</button>
         </div>
         <span class="pill" id="pill-privacy" data-tone="ok">Temporary · nothing saved</span>
         <span class="pill" id="pill-backend" data-tone="idle">GPU: —</span>
@@ -39,16 +63,24 @@
 
     <main class="shell">
       <aside class="rail">
-        <!-- SIMPLE: one-click start -->
-        <section class="panel simple-only">
+        <section class="panel" id="panel-start">
           <h2>Get started</h2>
-          <p class="simple-lead" id="simple-lead">
-            We’ll pick a model that fits this computer. Nothing is saved — chats and downloads are temporary for this visit only.
+          <p class="simple-lead">
+            We’ll pick a model that fits this computer. Nothing is saved — chats and downloads last only for this visit.
           </p>
-          <div class="auto-card" id="auto-card">
-            <div class="auto-row"><span>Recommended model</span><strong id="auto-model-label">Detecting…</strong></div>
-            <div class="auto-row"><span>Reply length</span><strong id="auto-length-label">Normal (essays OK)</strong></div>
-            <div class="auto-row"><span>Storage</span><strong id="auto-cache-label">None · session only</strong></div>
+          <div class="auto-card">
+            <div class="auto-row">
+              <span>Recommended model</span>
+              <strong id="auto-model-label">Detecting…</strong>
+            </div>
+            <div class="auto-row">
+              <span>Reply length</span>
+              <strong id="auto-length-label">Normal (~1024 tokens)</strong>
+            </div>
+            <div class="auto-row">
+              <span>Storage</span>
+              <strong id="auto-cache-label">None · session only</strong>
+            </div>
           </div>
           <label class="field">
             <span>How long should answers be?</span>
@@ -58,43 +90,40 @@
               <option value="long">Long — multi-page writing</option>
             </select>
           </label>
-          <button type="button" class="btn primary btn-block" id="boot-btn">Start AI</button>
-          <button type="button" class="btn ghost btn-block" id="reset-btn" disabled style="margin-top:0.45rem">Stop &amp; erase session</button>
-          <p class="privacy-note" style="margin-top:0.75rem">
+          <div class="btn-stack">
+            <button type="button" class="btn primary" id="boot-btn">Start AI</button>
+            <button type="button" class="btn ghost" id="reset-btn" disabled>Stop &amp; erase session</button>
+          </div>
+          <p class="privacy-note">
             <strong>Temporary by design:</strong> chat is never saved. Model files are cleared when you stop or close this tab.
-            Closing the page wipes the session.
           </p>
+          <div class="progress-block" style="margin-top:0.85rem">
+            <div class="progress-meta">
+              <span id="simple-status-label">Ready when you are</span>
+              <span id="simple-load-pct">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="simple-progress-bar"></div>
+            </div>
+          </div>
+          <p class="error-banner" id="boot-error" hidden></p>
         </section>
 
-        <!-- ADVANCED: full controls (hidden in Simple) -->
-        <div id="advanced-panels" class="advanced-only" hidden>
+        <div id="advanced-panels" hidden>
           <section class="panel">
-            <h2>Device profile</h2>
+            <h2>Device</h2>
             <div class="specs">
-              <div class="spec">
-                <span class="spec-k">CPU threads</span>
-                <span class="spec-v" id="spec-threads">—</span>
-              </div>
-              <div class="spec">
-                <span class="spec-k">Device memory</span>
-                <span class="spec-v" id="spec-memory">—</span>
-              </div>
-              <div class="spec">
-                <span class="spec-k">WebGPU</span>
-                <span class="spec-v" id="spec-gpu">Detecting…</span>
-              </div>
-              <div class="spec">
-                <span class="spec-k">Token budget</span>
-                <span class="spec-v" id="spec-oom">—</span>
-              </div>
+              <div class="spec"><span class="spec-k">CPU</span><span class="spec-v" id="spec-threads">—</span></div>
+              <div class="spec"><span class="spec-k">Memory</span><span class="spec-v" id="spec-memory">—</span></div>
+              <div class="spec"><span class="spec-k">WebGPU</span><span class="spec-v" id="spec-gpu">Detecting…</span></div>
+              <div class="spec"><span class="spec-k">Max tokens</span><span class="spec-v" id="spec-oom">—</span></div>
             </div>
           </section>
 
           <section class="panel">
-            <h2>Execution providers</h2>
+            <h2>Providers</h2>
             <ul class="providers" id="provider-list">
               <li data-id="webgpu"><span class="prov-name">WebGPU</span><span class="prov-state">…</span></li>
-              <li data-id="wasm"><span class="prov-name">WASM</span><span class="prov-state">WebGPU required</span></li>
               <li data-id="worker"><span class="prov-name">LLM worker</span><span class="prov-state">Idle</span></li>
             </ul>
           </section>
@@ -102,19 +131,18 @@
           <section class="panel">
             <h2>Telemetry</h2>
             <div class="telemetry">
-              <div class="tel-row"><span>Active model</span><strong id="model-badge">—</strong></div>
-              <div class="tel-row"><span>Load / cache</span><strong id="tel-cache">—</strong></div>
-              <div class="tel-row"><span>Prefill / decode</span><strong id="tel-speed">—</strong></div>
-              <div class="tel-row"><span>Token throughput</span><strong id="tel-tps">0.0 tok/s</strong></div>
+              <div class="tel-row"><span>Model</span><strong id="model-badge">—</strong></div>
+              <div class="tel-row"><span>Load</span><strong id="tel-cache">—</strong></div>
+              <div class="tel-row"><span>Tokens</span><strong id="tel-tps">0.0 tok/s</strong></div>
               <div class="tel-row"><span>Latency</span><strong id="tel-latency">—</strong></div>
-              <div class="tel-row"><span>Runtime stats</span><strong id="tel-bytes">—</strong></div>
+              <div class="tel-row"><span>Stats</span><strong id="tel-bytes">—</strong></div>
             </div>
             <div class="progress-block">
               <div class="progress-meta">
                 <span id="load-status-label">Standby</span>
                 <span id="load-pct">0%</span>
               </div>
-              <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
+              <div class="progress-track" id="progress-track">
                 <div class="progress-fill" id="progress-bar"></div>
               </div>
             </div>
@@ -123,7 +151,7 @@
           <section class="panel">
             <h2>Manual config</h2>
             <label class="field">
-              <span>Config mode</span>
+              <span>Config</span>
               <select id="config-mode">
                 <option value="auto" selected>Auto (recommended)</option>
                 <option value="manual">Manual model pick</option>
@@ -131,7 +159,7 @@
             </label>
             <label class="field">
               <span>Model</span>
-              <select id="model-select">
+              <select id="model-select" disabled>
                 <option value="Qwen2.5-0.5B-Instruct-q4f16_1-MLC">Qwen2.5 0.5B (~0.4 GB)</option>
                 <option value="SmolLM2-360M-Instruct-q4f16_1-MLC">SmolLM2 360M (~0.3 GB)</option>
                 <option value="TinyLlama-1.1B-Chat-v1.0-q4f16_1-MLC">TinyLlama 1.1B (~0.7 GB)</option>
@@ -145,7 +173,7 @@
               <input type="text" id="system-prompt" value="You are a helpful assistant running fully locally in the user's browser. Give complete answers unless asked to be brief." />
             </label>
             <label class="field">
-              <span>Max new tokens (override)</span>
+              <span>Max tokens override</span>
               <select id="max-tokens-override">
                 <option value="0" selected>Use reply-length setting</option>
                 <option value="256">256</option>
@@ -154,10 +182,10 @@
                 <option value="2048">2048</option>
               </select>
             </label>
-            <button type="button" class="btn danger btn-block" id="clear-cache-btn">Erase session + model files</button>
+            <button type="button" class="btn danger" id="clear-cache-btn">Erase session</button>
           </section>
 
-          <section class="panel console-panel">
+          <section class="panel">
             <div class="console-head">
               <h2>Diagnostics</h2>
               <button type="button" class="btn tiny" id="clear-log">Clear</button>
@@ -165,23 +193,6 @@
             <div class="console" id="log-box" role="log"></div>
           </section>
         </div>
-
-        <!-- Simple progress (always visible under start) -->
-        <section class="panel simple-only" id="simple-progress-panel">
-          <h2>Status</h2>
-          <div class="progress-block">
-            <div class="progress-meta">
-              <span id="simple-status-label">Ready when you are</span>
-              <span id="simple-load-pct">0%</span>
-            </div>
-            <div class="progress-track">
-              <div class="progress-fill" id="simple-progress-bar"></div>
-            </div>
-          </div>
-          <p class="hint" id="cache-hint" style="margin-top:0.55rem">
-            No lasting storage. Chat lives in RAM for this tab only; model downloads are deleted when you stop or leave.
-          </p>
-        </section>
       </aside>
 
       <section class="workspace">
@@ -192,7 +203,7 @@
           </div>
           <div class="chat-box" id="chat-viewport" aria-live="polite">
             <div class="msg ai">
-              Press <strong>Start AI</strong>. Chats are never written to disk. Closing the tab or pressing Stop erases the session (including temporary model files).
+              Press <strong>Start AI</strong>. Nothing is written to disk. Closing the tab or pressing Stop erases this session.
             </div>
           </div>
           <form class="input-row" id="prompt-form">
@@ -200,12 +211,12 @@
             <button type="submit" class="btn primary" id="send-btn" disabled>Send</button>
             <button type="button" class="btn ghost" id="abort-btn" disabled>Stop</button>
           </form>
-          <p class="hint">Try: “Write a 5-paragraph essay about dolphins” · “What is 10+10?”</p>
+          <p class="hint">Try: “What is 10+10?” · “Write a short paragraph about dolphins”</p>
         </div>
       </section>
     </main>
   </div>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="app.js?v=4"></script>
 </body>
 </html>
