@@ -1,6 +1,6 @@
 /**
- * Browser AI Hub — Phase 1 (incognito) + Phase 2 (Simple/Advanced).
- * Large pastes are handled without recursive DOM / deep clones.
+ * Browser AI Hub — Phase 1–2 + opt-in local model cache (IndexedDB via WebLLM).
+ * Chat stays ephemeral; saved model weights persist until the user removes them.
  */
 const DEFAULT_SYSTEM_PROMPT = `You are a locally hosted coding assistant running entirely in the user's browser. You help with software engineering: writing code, debugging, explaining APIs, reviewing diffs, designing small architectures, and walking through lab/coursework-style programming exercises.
 
@@ -13,6 +13,62 @@ const LENGTH_TOKENS = { short: 256, normal: 1024, long: 2048, unlimited: null };
 const PREVIEW_CHARS = 4000;
 /** Absolute ceiling — never accept a single paste larger than this (browser safety). */
 const HARD_PASTE_CEILING = 500_000;
+/** localStorage key for which model IDs the user opted to keep on disk. */
+const KEEP_MODELS_KEY = 'bah.keptModels';
+/** Default KV context before dynamic scale-up. */
+const DEFAULT_CONTEXT_WINDOW = 4096;
+/** Soft threshold — scale or slide when prompt uses this fraction of the window. */
+const CONTEXT_SOFT_RATIO = 0.85;
+/** Max fallback retries for ContextWindowSizeExceededError. */
+const CONTEXT_OVERFLOW_RETRIES = 3;
+
+/**
+ * Mode-based presets: system style, output budget, and context strategy.
+ * - code: prefer larger fixed context_window_size + chunked file handling
+ * - writing: sliding_window_size for long-form history
+ * - short: aggressive trim + concise outputs
+ */
+const MODE_PRESETS = {
+  code: {
+    id: 'code',
+    label: 'Code',
+    strategy: 'scale', // grow context_window_size toward model max
+    defaultContext: 8192,
+    maxOutputTokens: 4096,
+    outputReserve: 1024,
+    historyTurns: 24,
+    temperature: 0.4,
+    systemExtra:
+      'Mode: CODE. Prioritize complete, runnable code and full-file reasoning. Prefer concrete diffs and fenced blocks. Use available context fully; if the user pasted a large file, work from the provided chunks carefully.',
+  },
+  writing: {
+    id: 'writing',
+    label: 'Writing',
+    strategy: 'sliding', // context_window_size=-1, sliding_window_size>0
+    defaultContext: 4096,
+    slidingWindow: 4096,
+    attentionSink: 4,
+    maxOutputTokens: 2048,
+    outputReserve: 768,
+    historyTurns: 16,
+    temperature: 0.8,
+    systemExtra:
+      'Mode: WRITING. Optimize for clear long-form prose. Maintain narrative coherence using recent context; older turns may be summarized or slid out of the window.',
+  },
+  short: {
+    id: 'short',
+    label: 'Short',
+    strategy: 'tight', // keep small fixed window + hard history trim
+    defaultContext: 2048,
+    maxOutputTokens: 256,
+    outputReserve: 256,
+    historyTurns: 4,
+    temperature: 0.5,
+    systemExtra:
+      'Mode: SHORT. Reply in a few sentences or a minimal code fix. Do not pad. Ignore tangential history.',
+  },
+};
+
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -59,6 +115,9 @@ const els = {
   autoModelLabel: $('auto-model-label'),
   autoLengthLabel: $('auto-length-label'),
   autoCacheLabel: $('auto-cache-label'),
+  autoModeLabel: $('auto-mode-label'),
+  autoContextLabel: $('auto-context-label'),
+  chatMode: $('chat-mode'),
   tokenMeterLabel: $('token-meter-label'),
   tokenMeterFill: $('token-meter-fill'),
   advancedPanels: $('advanced-panels'),
@@ -82,13 +141,22 @@ const els = {
   onboarding: $('onboarding'),
   dismissOnboard: $('dismiss-onboard'),
   pasteWarn: $('paste-warn'),
+  saveModelBtn: $('save-model-btn'),
+  removeModelBtn: $('remove-model-btn'),
+  saveModelBtnAdv: $('save-model-btn-adv'),
+  removeModelBtnAdv: $('remove-model-btn-adv'),
+  modelCacheStatus: $('model-cache-status'),
+  modelCacheStatusAdv: $('model-cache-status-adv'),
 };
 
 let CreateWebWorkerMLCEngine = null;
 let deleteModelAllInfoInCache = null;
+let hasModelInCache = null;
 let prebuiltAppConfig = null;
 let ModelType = null;
 let webllmReady = null;
+/** Shared AppConfig with IndexedDB cache enabled for large model weights. */
+let appConfig = null;
 
 let registry = { categories: [], templates: [] };
 let modelCatalog = [];
@@ -103,6 +171,22 @@ let activeModelId = null;
 let purging = false;
 let uiMode = 'simple';
 let byokKey = '';
+/** True while Save Model Locally is downloading/caching. */
+let savingModel = false;
+/** Last known cache hit for the selected model. */
+let selectedModelCached = false;
+/** Prevent double auto-load on startup. */
+let autoLoadAttempted = false;
+/**
+ * Active WebLLM chatOpts window configuration for the loaded engine.
+ * Exactly one of context_window_size / sliding_window_size is positive (−1 disables).
+ */
+let engineContext = {
+  context_window_size: DEFAULT_CONTEXT_WINDOW,
+  sliding_window_size: -1,
+  attention_sink_size: -1,
+  mode: 'code',
+};
 
 /** Ephemeral undo/redo (RAM only) */
 const undoStack = [];
@@ -171,8 +255,11 @@ async function ensureWebLLM() {
       .then((m) => {
         CreateWebWorkerMLCEngine = m.CreateWebWorkerMLCEngine;
         deleteModelAllInfoInCache = m.deleteModelAllInfoInCache;
+        hasModelInCache = m.hasModelInCache;
         prebuiltAppConfig = m.prebuiltAppConfig;
         ModelType = m.ModelType;
+        // Prefer IndexedDB — larger quota than Cache API for multi‑GB weights
+        appConfig = Object.assign({}, prebuiltAppConfig, { useIndexedDBCache: true });
         return true;
       })
       .catch((err) => {
@@ -181,6 +268,123 @@ async function ensureWebLLM() {
       });
   }
   return webllmReady;
+}
+
+function getAppConfig() {
+  if (appConfig) return appConfig;
+  if (prebuiltAppConfig) {
+    appConfig = Object.assign({}, prebuiltAppConfig, { useIndexedDBCache: true });
+  }
+  return appConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in local model keep-list (tiny preference only — not chat data)
+// ---------------------------------------------------------------------------
+function getKeptModels() {
+  try {
+    const raw = localStorage.getItem(KEEP_MODELS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      if (typeof v === 'string' && v && out.indexOf(v) === -1) out.push(v);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function setKeptModels(ids) {
+  try {
+    localStorage.setItem(KEEP_MODELS_KEY, JSON.stringify(uniqueStrings(ids || [])));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function isModelKept(modelId) {
+  if (!modelId) return false;
+  const kept = getKeptModels();
+  for (let i = 0; i < kept.length; i++) {
+    if (kept[i] === modelId) return true;
+  }
+  return false;
+}
+
+function markModelKept(modelId) {
+  if (!modelId) return;
+  const kept = getKeptModels();
+  if (kept.indexOf(modelId) === -1) kept.push(modelId);
+  setKeptModels(kept);
+}
+
+function unmarkModelKept(modelId) {
+  if (!modelId) return;
+  setKeptModels(getKeptModels().filter((id) => id !== modelId));
+}
+
+function setModelCacheStatus(text, tone) {
+  const nodes = [els.modelCacheStatus, els.modelCacheStatusAdv];
+  for (let i = 0; i < nodes.length; i++) {
+    const el = nodes[i];
+    if (!el) continue;
+    el.textContent = text || '';
+    if (tone) el.dataset.tone = tone;
+    else delete el.dataset.tone;
+  }
+}
+
+function setModelCacheButtons({ canSave, canRemove, busy }) {
+  const saveBtns = [els.saveModelBtn, els.saveModelBtnAdv];
+  const removeBtns = [els.removeModelBtn, els.removeModelBtnAdv];
+  for (let i = 0; i < saveBtns.length; i++) {
+    if (saveBtns[i]) saveBtns[i].disabled = !!busy || !canSave;
+  }
+  for (let i = 0; i < removeBtns.length; i++) {
+    if (removeBtns[i]) removeBtns[i].disabled = !!busy || !canRemove;
+  }
+}
+
+async function refreshModelCacheStatus(modelId) {
+  const id = modelId || selectedModelId();
+  if (!id) {
+    selectedModelCached = false;
+    setModelCacheStatus('Select a model to check local cache.', 'idle');
+    setModelCacheButtons({ canSave: false, canRemove: false, busy: savingModel });
+    if (els.autoCacheLabel) els.autoCacheLabel.textContent = '—';
+    return false;
+  }
+  let cached = false;
+  try {
+    await ensureWebLLM();
+    if (typeof hasModelInCache === 'function') {
+      cached = !!(await hasModelInCache(id, getAppConfig()));
+    }
+  } catch {
+    cached = false;
+  }
+  selectedModelCached = cached;
+  const kept = isModelKept(id);
+  if (cached && kept) {
+    setModelCacheStatus(`Saved locally: ${id.split('-').slice(0, 3).join(' ')} — fast start available.`, 'ok');
+    if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'Local IndexedDB';
+  } else if (cached) {
+    setModelCacheStatus(`Weights found in browser storage for this model. Click Save to keep them across visits.`, 'ok');
+    if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'Cached (session)';
+  } else {
+    setModelCacheStatus(`Not saved locally. Start AI or Save Model Locally to download from the CDN.`, 'idle');
+    if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'Remote / RAM';
+  }
+  setModelCacheButtons({
+    canSave: !savingModel && !generating,
+    canRemove: cached || kept,
+    busy: savingModel || generating,
+  });
+  return cached;
 }
 
 function isChatModel(rec) {
@@ -327,9 +531,10 @@ async function purgeModelCaches(ids) {
   } catch {
     return;
   }
+  const cfg = getAppConfig();
   for (const id of list) {
     try {
-      await deleteModelAllInfoInCache(id, prebuiltAppConfig);
+      await deleteModelAllInfoInCache(id, cfg);
     } catch {
       /* ignore */
     }
@@ -360,7 +565,17 @@ async function wipeSession() {
     }
     booted = false;
     generating = false;
-    await purgeModelCaches(activeModelId ? [activeModelId] : []);
+    engineContext = {
+      context_window_size: DEFAULT_CONTEXT_WINDOW,
+      sliding_window_size: -1,
+      attention_sink_size: -1,
+      mode: selectedChatMode(),
+    };
+    // Preserve opt-in saved models; purge only ephemeral (non-kept) weights
+    const kept = getKeptModels();
+    if (activeModelId && kept.indexOf(activeModelId) === -1) {
+      await purgeModelCaches([activeModelId]);
+    }
     activeModelId = null;
     try {
       sessionStorage.clear();
@@ -368,7 +583,9 @@ async function wipeSession() {
       /* ignore */
     }
     try {
+      // Clear ephemeral keys but restore the keep-list preference
       localStorage.clear();
+      setKeptModels(kept);
     } catch {
       /* ignore */
     }
@@ -496,6 +713,339 @@ function sumContentLengths(messages) {
     if (typeof c === 'string') n += c.length;
   }
   return n;
+}
+
+function estimateMessagesTokens(messages) {
+  // ~4 chars/token + small per-message role overhead
+  let chars = 0;
+  let count = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const c = messages[i]?.content;
+    if (typeof c === 'string') chars += c.length;
+    count += 1;
+  }
+  return Math.ceil(chars / 4) + count * 4;
+}
+
+function selectedChatMode() {
+  const v = els.chatMode?.value || 'code';
+  return MODE_PRESETS[v] ? v : 'code';
+}
+
+function getModePreset(modeId) {
+  return MODE_PRESETS[modeId || selectedChatMode()] || MODE_PRESETS.code;
+}
+
+/**
+ * Model-advertised max context (from WebLLM record overrides) with safe VRAM caps.
+ */
+function getModelMaxContext(modelId) {
+  const id = String(modelId || activeModelId || selectedModelId() || '');
+  const full = (prebuiltAppConfig?.model_list || []).find((m) => m.model_id === id);
+  const o = full?.overrides || {};
+  if (Number.isFinite(o.context_window_size) && o.context_window_size > 0) {
+    return o.context_window_size;
+  }
+  if (Number.isFinite(o.sliding_window_size) && o.sliding_window_size > 0) {
+    return o.sliding_window_size;
+  }
+  const lower = id.toLowerCase();
+  if (/1m|1000k/.test(lower)) return 32768;
+  if (/128k/.test(lower)) return 16384;
+  if (/64k|32k/.test(lower)) return 16384;
+  if (/16k|8192|8k/.test(lower)) return 8192;
+  if (/gemma-2b|0\.5b|360m|1b-|tinyllama|smollm/i.test(lower)) return 8192;
+  if (/3b|phi-3|7b|8b/.test(lower)) return 8192;
+  return 8192;
+}
+
+function effectiveContextBudget() {
+  if (engineContext.sliding_window_size > 0) return engineContext.sliding_window_size;
+  if (engineContext.context_window_size > 0) return engineContext.context_window_size;
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
+function buildChatOptsForMode(modeId, contextSize) {
+  const preset = getModePreset(modeId);
+  const modelMax = getModelMaxContext();
+  const size = Math.min(
+    modelMax,
+    Math.max(1024, contextSize || preset.defaultContext || DEFAULT_CONTEXT_WINDOW)
+  );
+
+  if (preset.strategy === 'sliding') {
+    const slide = Math.min(modelMax, Math.max(2048, preset.slidingWindow || size));
+    return {
+      context_window_size: -1,
+      sliding_window_size: slide,
+      attention_sink_size: preset.attentionSink >= 0 ? preset.attentionSink : 4,
+    };
+  }
+
+  // scale + tight: fixed KV window (sliding disabled)
+  const ctx =
+    preset.strategy === 'tight'
+      ? Math.min(size, preset.defaultContext || 2048)
+      : size;
+  return {
+    context_window_size: ctx,
+    sliding_window_size: -1,
+    attention_sink_size: -1,
+  };
+}
+
+function chatOptsEqual(a, b) {
+  if (!a || !b) return false;
+  return (
+    a.context_window_size === b.context_window_size &&
+    a.sliding_window_size === b.sliding_window_size &&
+    (a.attention_sink_size || -1) === (b.attention_sink_size || -1)
+  );
+}
+
+function applyEngineContextState(chatOpts, modeId) {
+  engineContext = {
+    context_window_size: chatOpts.context_window_size,
+    sliding_window_size: chatOpts.sliding_window_size,
+    attention_sink_size: chatOpts.attention_sink_size ?? -1,
+    mode: modeId || selectedChatMode(),
+  };
+  if (els.autoContextLabel) {
+    const label =
+      engineContext.sliding_window_size > 0
+        ? `slide ${engineContext.sliding_window_size}`
+        : `ctx ${engineContext.context_window_size}`;
+    els.autoContextLabel.textContent = label;
+  }
+}
+
+/**
+ * Reload the live engine with new context / sliding-window chatOpts (same weights).
+ */
+async function reloadEngineContext(chatOpts, modeId) {
+  if (!engine || !activeModelId) {
+    applyEngineContextState(chatOpts, modeId);
+    return;
+  }
+  if (chatOptsEqual(chatOpts, engineContext)) {
+    applyEngineContextState(chatOpts, modeId);
+    return;
+  }
+  writeLog(
+    `Resizing context → ctx=${chatOpts.context_window_size} slide=${chatOpts.sliding_window_size}`,
+    'warn'
+  );
+  setStatus('Adjusting context window…', 'busy');
+  await engine.reload(activeModelId, chatOpts);
+  applyEngineContextState(chatOpts, modeId);
+  setStatus('Ready', 'ok');
+}
+
+/**
+ * Before a prompt: estimate tokens and scale context_window_size or enable sliding window.
+ */
+async function ensureDynamicContext(promptTokens, modeId) {
+  const preset = getModePreset(modeId);
+  const modelMax = getModelMaxContext();
+  const reserve = preset.outputReserve || 512;
+  const needed = promptTokens + reserve;
+  const current = effectiveContextBudget();
+
+  if (preset.strategy === 'sliding') {
+    let slide = Math.max(preset.slidingWindow || DEFAULT_CONTEXT_WINDOW, current);
+    if (needed > slide * CONTEXT_SOFT_RATIO) {
+      slide = Math.min(modelMax, Math.max(needed, slide * 2));
+    }
+    slide = Math.min(modelMax, Math.max(2048, slide));
+    await reloadEngineContext(buildChatOptsForMode('writing', slide), 'writing');
+    return effectiveContextBudget();
+  }
+
+  if (preset.strategy === 'tight') {
+    const tight = Math.min(modelMax, preset.defaultContext || 2048);
+    await reloadEngineContext(buildChatOptsForMode('short', tight), 'short');
+    return effectiveContextBudget();
+  }
+
+  // code / scale
+  let target = current > 0 ? current : DEFAULT_CONTEXT_WINDOW;
+  if (needed > target * CONTEXT_SOFT_RATIO) {
+    // Step up: 4096 → 8192 → 16384 → modelMax
+    const steps = [4096, 8192, 16384, modelMax];
+    target = modelMax;
+    for (let i = 0; i < steps.length; i++) {
+      if (steps[i] >= needed) {
+        target = Math.min(modelMax, steps[i]);
+        break;
+      }
+    }
+    target = Math.min(modelMax, Math.max(needed, target));
+    writeLog(
+      `Prompt ~${promptTokens} tok → scaling context_window_size to ${target} (max ${modelMax})`,
+      'warn'
+    );
+  } else {
+    target = Math.min(modelMax, Math.max(target, preset.defaultContext || DEFAULT_CONTEXT_WINDOW));
+  }
+  await reloadEngineContext(buildChatOptsForMode('code', target), 'code');
+  return effectiveContextBudget();
+}
+
+/**
+ * Fit messages under a token budget: keep system + newest turns; compress oversized bodies.
+ */
+function fitMessagesToBudget(messages, budgetTokens, modeId) {
+  const preset = getModePreset(modeId);
+  const maxTurns = preset.historyTurns || 12;
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    out.push({
+      role: messages[i].role,
+      content: typeof messages[i].content === 'string' ? messages[i].content : '',
+    });
+  }
+
+  // Drop oldest user/assistant pairs beyond historyTurns
+  const system = out.length && out[0].role === 'system' ? out[0] : null;
+  let rest = system ? out.slice(1) : out.slice();
+  while (rest.length > maxTurns * 2) {
+    rest.shift();
+  }
+
+  const rebuild = () => {
+    const m = [];
+    if (system) m.push(system);
+    for (let i = 0; i < rest.length; i++) m.push(rest[i]);
+    return m;
+  };
+
+  let fitted = rebuild();
+  let tokens = estimateMessagesTokens(fitted);
+
+  // Drop oldest history until under budget
+  while (tokens > budgetTokens && rest.length > 1) {
+    rest.shift();
+    // Keep message order valid: prefer starting on user after system
+    while (rest.length && rest[0].role === 'assistant') rest.shift();
+    fitted = rebuild();
+    tokens = estimateMessagesTokens(fitted);
+  }
+
+  // Compress largest remaining message (usually the latest paste) if still over
+  if (tokens > budgetTokens) {
+    const room = Math.max(256, budgetTokens - (system ? estimateMessagesTokens([system]) : 0) - 64);
+    for (let i = fitted.length - 1; i >= 0; i--) {
+      if (fitted[i].role === 'system') continue;
+      const text = fitted[i].content;
+      const approx = Math.ceil(text.length / 4);
+      if (approx <= room) continue;
+      const keepChars = Math.max(400, room * 4);
+      const head = Math.floor(keepChars * 0.55);
+      const tail = keepChars - head;
+      fitted[i] = {
+        role: fitted[i].role,
+        content:
+          text.slice(0, head) +
+          `\n\n…[compressed for context window; ${text.length.toLocaleString()} chars total]…\n\n` +
+          text.slice(-tail),
+      };
+      tokens = estimateMessagesTokens(fitted);
+      if (tokens <= budgetTokens) break;
+    }
+  }
+
+  return fitted;
+}
+
+/**
+ * Summarize-style compression of older history into one system note (iterative, no recursion).
+ */
+function compressOldestHistory(messages) {
+  if (!messages.length) return messages;
+  const out = [];
+  let i = 0;
+  if (messages[0]?.role === 'system') {
+    out.push({ role: 'system', content: messages[0].content });
+    i = 1;
+  }
+  if (messages.length - i <= 2) {
+    for (; i < messages.length; i++) out.push({ role: messages[i].role, content: messages[i].content });
+    return out;
+  }
+  // Fold the oldest two turns into a brief note, keep the rest
+  const dropped = [];
+  const take = Math.min(2, messages.length - i - 1);
+  for (let k = 0; k < take; k++) {
+    dropped.push(messages[i + k]);
+  }
+  i += take;
+  let summary = 'Earlier context (compressed): ';
+  for (let k = 0; k < dropped.length; k++) {
+    const t = dropped[k].content || '';
+    summary += `[${dropped[k].role}] ${t.slice(0, 180)}${t.length > 180 ? '…' : ''} `;
+  }
+  out.push({ role: 'system', content: summary.slice(0, 1200) });
+  for (; i < messages.length; i++) {
+    out.push({ role: messages[i].role, content: messages[i].content });
+  }
+  return out;
+}
+
+function isContextWindowError(err) {
+  const name = err?.name || '';
+  const msg = err?.message || String(err || '');
+  return (
+    name === 'ContextWindowSizeExceededError' ||
+    /ContextWindowSizeExceeded/i.test(msg) ||
+    /Prompt tokens exceed context window size/i.test(msg) ||
+    /exceed context window/i.test(msg)
+  );
+}
+
+/**
+ * Fallback when WebLLM throws ContextWindowSizeExceededError:
+ * compress / slice oldest history, optionally bump window, then retry.
+ */
+async function fallbackAfterContextOverflow(messages, modeId, attempt) {
+  writeLog(`Context overflow fallback · attempt ${attempt + 1}`, 'warn');
+  let next = compressOldestHistory(messages);
+  next = fitMessagesToBudget(
+    next,
+    Math.max(512, Math.floor(effectiveContextBudget() * 0.55)),
+    modeId
+  );
+
+  const preset = getModePreset(modeId);
+  const modelMax = getModelMaxContext();
+  if (attempt === 0 && preset.strategy !== 'tight') {
+    // First fallback: scale window or switch to sliding
+    if (preset.strategy === 'sliding' || attempt >= 1) {
+      await reloadEngineContext(
+        {
+          context_window_size: -1,
+          sliding_window_size: Math.min(modelMax, Math.max(4096, effectiveContextBudget())),
+          attention_sink_size: 4,
+        },
+        modeId
+      );
+    } else {
+      const bumped = Math.min(modelMax, Math.max(effectiveContextBudget() * 2, 8192));
+      await reloadEngineContext(buildChatOptsForMode('code', bumped), modeId);
+    }
+  } else if (attempt >= 1) {
+    // Hard switch to sliding window as last resort
+    await reloadEngineContext(
+      {
+        context_window_size: -1,
+        sliding_window_size: Math.min(modelMax, 4096),
+        attention_sink_size: 4,
+      },
+      modeId
+    );
+    next = fitMessagesToBudget(next, Math.floor(effectiveContextBudget() * 0.5), 'short');
+  }
+
+  return next;
 }
 
 /**
@@ -650,7 +1200,19 @@ function resolveMaxTokens() {
   const override = Number(els.maxTokensOverride?.value || 0);
   if (override > 0) return override;
   const key = els.lengthSelect?.value || 'unlimited';
-  return Object.prototype.hasOwnProperty.call(LENGTH_TOKENS, key) ? LENGTH_TOKENS[key] : null;
+  if (key !== 'unlimited' && Object.prototype.hasOwnProperty.call(LENGTH_TOKENS, key)) {
+    return LENGTH_TOKENS[key];
+  }
+  // Mode default when reply length is "unlimited"
+  return getModePreset().maxOutputTokens;
+}
+
+function resolveTemperature() {
+  const preset = getModePreset();
+  const raw = els.temperature?.value;
+  // If user hasn't touched advanced temp, prefer mode default when in simple mode
+  if (uiMode === 'simple' && preset.temperature != null) return preset.temperature;
+  return Number(raw || preset.temperature || 0.7);
 }
 
 function syncLabels() {
@@ -662,18 +1224,26 @@ function syncLabels() {
     short: 'Short',
     normal: 'Normal',
     long: 'Long',
-    unlimited: 'Unlimited',
+    unlimited: 'Mode default',
   };
   if (els.autoLengthLabel) {
     els.autoLengthLabel.textContent = labels[els.lengthSelect?.value || 'unlimited'];
   }
-  if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'RAM only';
+  const preset = getModePreset();
+  if (els.autoModeLabel) els.autoModeLabel.textContent = preset.label;
+  if (els.autoContextLabel && !booted) {
+    els.autoContextLabel.textContent =
+      preset.strategy === 'sliding'
+        ? `slide ${preset.slidingWindow || 4096}`
+        : `ctx ${preset.defaultContext || DEFAULT_CONTEXT_WINDOW}`;
+  }
   const cap = resolveMaxTokens();
   if (els.oom) els.oom.textContent = cap == null ? 'Unlimited' : `${cap}`;
   if ((els.configMode?.value || 'auto') === 'auto' && els.modelSelect && rec.model_id) {
     els.modelSelect.value = rec.model_id;
   }
   updateTokenMeter();
+  refreshModelCacheStatus(rec.model_id).catch(() => {});
 }
 
 function setUiMode(mode) {
@@ -734,28 +1304,38 @@ function onInitProgress(report) {
   setStatus(pct >= 100 ? 'Almost ready…' : 'Loading…', 'busy');
 }
 
-async function loadLLM() {
+async function loadLLM(opts) {
+  const options = opts || {};
   showBootError('');
   if (!(await probeWebGPU())) return;
   setBootEnabled(false);
-  setStatus('Starting…', 'busy');
-  updateProgress(2, 'Engine…');
+  setModelCacheButtons({ canSave: false, canRemove: selectedModelCached, busy: true });
+  setStatus(options.fromCache ? 'Loading from local cache…' : 'Starting…', 'busy');
+  updateProgress(2, options.fromCache ? 'Local cache…' : 'Engine…');
   try {
     await ensureWebLLM();
     if (!catalogLoaded) await loadModelCatalog();
   } catch (err) {
     showBootError(`Engine CDN failed: ${err.message}`);
     setBootEnabled(true);
+    refreshModelCacheStatus().catch(() => {});
     return;
   }
-  const modelId = selectedModelId();
+  const modelId = options.modelId || selectedModelId();
   if (!modelId) {
     showBootError('No model available yet.');
     setBootEnabled(true);
+    refreshModelCacheStatus().catch(() => {});
     return;
   }
   if (els.modelSelect) els.modelSelect.value = modelId;
-  writeLog(`Load ${modelId}`, 'info');
+  const wasCached = await refreshModelCacheStatus(modelId);
+  writeLog(
+    wasCached || options.fromCache
+      ? `Load ${modelId} (prefer local cache)`
+      : `Load ${modelId} (remote download)`,
+    'info'
+  );
   try {
     if (engine) {
       try {
@@ -765,12 +1345,20 @@ async function loadLLM() {
       }
       engine = null;
     }
-    await purgeModelCaches([modelId]);
+    // Do NOT purge before load — that defeated local caching.
+    // Ephemeral models are cleared on tab close via wipeSession if not kept.
+    const modeId = selectedChatMode();
+    const chatOpts = buildChatOptsForMode(modeId);
     engine = await CreateWebWorkerMLCEngine(
       new Worker(new URL('./llm-worker.js', import.meta.url), { type: 'module' }),
       modelId,
-      { initProgressCallback: onInitProgress }
+      {
+        initProgressCallback: onInitProgress,
+        appConfig: getAppConfig(),
+      },
+      chatOpts
     );
+    applyEngineContextState(chatOpts, modeId);
     booted = true;
     activeModelId = modelId;
     if (els.modelBadge) els.modelBadge.textContent = modelId.replace(/-MLC.*$/, '');
@@ -785,16 +1373,195 @@ async function loadLLM() {
     if (els.bootBtnMain) els.bootBtnMain.textContent = 'Restart AI';
     els.promptInput?.focus();
     pushUndo();
+    const kept = isModelKept(modelId);
+    const src = wasCached || options.fromCache ? 'local cache' : 'CDN (now cached in browser)';
     appendMsg(
       'assistant',
-      `Ready (${modelId.split('-').slice(0, 3).join(' ')}). Paste large code freely — this session is RAM-only.`
+      `Ready (${modelId.split('-').slice(0, 3).join(' ')}) via ${src}.${
+        kept ? ' This model is saved for fast startups.' : ' Chat is RAM-only; use Save Model Locally to keep weights.'
+      }`
     );
+    await refreshModelCacheStatus(modelId);
   } catch (err) {
     showBootError(`Load failed: ${err.message}`);
     writeLog(String(err.message), 'error');
     setBootEnabled(true);
     engine = null;
     booted = false;
+    await refreshModelCacheStatus(modelId);
+  }
+}
+
+/**
+ * Download / retain the selected model in IndexedDB for faster future startups.
+ */
+async function saveModelLocally() {
+  if (savingModel || generating) return;
+  const modelId = selectedModelId();
+  if (!modelId) {
+    setModelCacheStatus('No model selected.', 'error');
+    return;
+  }
+  savingModel = true;
+  showBootError('');
+  setModelCacheButtons({ canSave: false, canRemove: false, busy: true });
+  setModelCacheStatus(`Saving ${modelId.split('-').slice(0, 3).join(' ')} to local IndexedDB…`, 'busy');
+  setStatus('Saving model locally…', 'busy');
+  writeLog(`Save Model Locally · ${modelId}`, 'info');
+
+  try {
+    await ensureWebLLM();
+    // Ensure weights are present: load (or reload) so WebLLM writes to IndexedDB
+    if (!booted || activeModelId !== modelId) {
+      await loadLLM({ modelId, fromCache: false });
+      if (!booted) throw new Error('Model load did not complete — nothing saved.');
+    } else {
+      // Already running — mark kept; weights should already be in cache from load
+      updateProgress(60, 'Verifying cache…');
+    }
+
+    markModelKept(modelId);
+    // Give the cache backend a tick, then verify
+    await yieldToMain();
+    let cached = false;
+    if (typeof hasModelInCache === 'function') {
+      cached = !!(await hasModelInCache(modelId, getAppConfig()));
+    }
+    if (!cached) {
+      // Rare: engine loaded from memory path without durable write — force reload once
+      updateProgress(40, 'Writing to IndexedDB…');
+      if (engine) {
+        try {
+          await engine.reload(modelId);
+        } catch {
+          /* reload optional */
+        }
+      }
+      cached = typeof hasModelInCache === 'function'
+        ? !!(await hasModelInCache(modelId, getAppConfig()))
+        : true;
+    }
+
+    selectedModelCached = !!cached;
+    updateProgress(100, cached ? 'Saved locally' : 'Marked for keep');
+    setStatus(cached ? 'Model saved locally' : 'Ready', 'ok');
+    setModelCacheStatus(
+      cached
+        ? `Success — ${modelId.split('-').slice(0, 3).join(' ')} is saved in IndexedDB for fast startups.`
+        : `Keep-list updated. Re-open after Start AI finishes caching if status still shows remote.`,
+      cached ? 'ok' : 'busy'
+    );
+    writeLog(cached ? `Cached OK · ${modelId}` : `Keep marked · ${modelId}`, 'info');
+    if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'Local IndexedDB';
+  } catch (err) {
+    unmarkModelKept(modelId);
+    setModelCacheStatus(`Save failed: ${err.message}`, 'error');
+    showBootError(`Save failed: ${err.message}`);
+    writeLog(String(err.message), 'error');
+    setStatus('Error', 'error');
+  } finally {
+    savingModel = false;
+    await refreshModelCacheStatus(modelId);
+  }
+}
+
+/**
+ * Clear cached weights for the selected (or active) model from IndexedDB / Cache.
+ */
+async function removeSavedModel() {
+  if (savingModel || generating) return;
+  const modelId = selectedModelId() || activeModelId;
+  if (!modelId) {
+    setModelCacheStatus('No model selected.', 'error');
+    return;
+  }
+  const ok = window.confirm(
+    `Remove saved model weights for:\n\n${modelId}\n\nThis frees browser storage. Next Start AI will re-download from the CDN.`
+  );
+  if (!ok) return;
+
+  savingModel = true;
+  setModelCacheButtons({ canSave: false, canRemove: false, busy: true });
+  setModelCacheStatus('Removing saved model from browser storage…', 'busy');
+  setStatus('Removing local model…', 'busy');
+  writeLog(`Remove Saved Model · ${modelId}`, 'info');
+
+  try {
+    // If this model is currently loaded, unload first so files aren't locked
+    if (engine && activeModelId === modelId) {
+      try {
+        await engine.interruptGenerate();
+      } catch {
+        /* ignore */
+      }
+      try {
+        await engine.unload();
+      } catch {
+        /* ignore */
+      }
+      engine = null;
+      booted = false;
+      activeModelId = null;
+      setComposerEnabled(false);
+      setResetEnabled(false);
+      if (els.bootBtn) els.bootBtn.textContent = 'Start AI';
+      if (els.bootBtnMain) els.bootBtnMain.textContent = 'Start AI';
+    }
+
+    await purgeModelCaches([modelId]);
+    unmarkModelKept(modelId);
+    selectedModelCached = false;
+    updateProgress(0, 'Removed');
+    setStatus('Local model removed', 'ok');
+    setModelCacheStatus('Saved model cleared from browser storage.', 'ok');
+    if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'Remote / RAM';
+    writeLog(`Purged cache · ${modelId}`, 'info');
+    appendMsg('assistant', `Removed local cache for ${modelId.split('-').slice(0, 3).join(' ')}.`);
+  } catch (err) {
+    setModelCacheStatus(`Remove failed: ${err.message}`, 'error');
+    showBootError(`Remove failed: ${err.message}`);
+    writeLog(String(err.message), 'error');
+  } finally {
+    savingModel = false;
+    await refreshModelCacheStatus(modelId);
+  }
+}
+
+/**
+ * On startup: if the selected/recommended model is already saved, load from local cache.
+ */
+async function autoLoadIfCached() {
+  if (autoLoadAttempted || booted) return;
+  autoLoadAttempted = true;
+  try {
+    await ensureWebLLM();
+    if (!catalogLoaded) await loadModelCatalog();
+    syncLabels();
+    const modelId = selectedModelId();
+    if (!modelId) {
+      setModelCacheStatus('No model available yet.', 'idle');
+      return;
+    }
+    const cached = await refreshModelCacheStatus(modelId);
+    const kept = isModelKept(modelId);
+    if (cached && kept) {
+      setModelCacheStatus('Local model found — loading for quick startup…', 'busy');
+      writeLog(`Auto-load from IndexedDB · ${modelId}`, 'info');
+      await loadLLM({ modelId, fromCache: true });
+    } else if (cached) {
+      setModelCacheStatus(
+        'Weights found in browser storage. Press Start AI for a fast load, or Save Model Locally to keep them.',
+        'ok'
+      );
+    } else {
+      setModelCacheStatus(
+        'No local model yet. Press Start AI (CDN) or Save Model Locally to download and keep weights.',
+        'idle'
+      );
+    }
+  } catch (err) {
+    writeLog(`Auto-load check: ${err.message}`, 'warn');
+    setModelCacheStatus('Could not check local cache — use Start AI to load from the CDN.', 'error');
   }
 }
 
@@ -813,8 +1580,13 @@ function setComposerEnabled(on) {
   if (els.sendBtn) els.sendBtn.disabled = !on;
 }
 
-function buildMessages(extraUserContent) {
-  const system = els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT;
+function buildMessages(extraUserContent, modeId) {
+  const preset = getModePreset(modeId);
+  const base = els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT;
+  // Append mode instruction without wiping a custom system prompt
+  const system = base.includes(preset.systemExtra)
+    ? base
+    : `${base}\n\n${preset.systemExtra}`;
   const out = [];
   out.push({ role: 'system', content: system });
   for (let i = 0; i < chatMessages.length; i++) {
@@ -841,9 +1613,12 @@ function yieldToMain() {
   });
 }
 
-async function runOneCompletion(messages, onDelta) {
+/**
+ * Core completion call (single attempt).
+ */
+async function createCompletionOnce(messages, onDelta) {
   const maxTokens = resolveMaxTokens();
-  const temperature = Number(els.temperature?.value || 0.7);
+  const temperature = resolveTemperature();
   const req = {
     messages,
     stream: true,
@@ -863,8 +1638,6 @@ async function runOneCompletion(messages, onDelta) {
     const delta = choice?.delta?.content || '';
     if (choice?.finish_reason) finishReason = choice.finish_reason;
     if (!delta) continue;
-    // Iterative concat (engineered string builder via array would also work;
-    // += is fine for stack — avoid recursive reduce)
     reply += delta;
     tokenCount += 1;
     uiTick += 1;
@@ -874,6 +1647,64 @@ async function runOneCompletion(messages, onDelta) {
   }
   if (onDelta) onDelta(reply);
   return { reply, finishReason, tokenCount };
+}
+
+/**
+ * Prepare messages for the active mode: estimate tokens, resize context, fit history.
+ */
+async function prepareMessagesForMode(rawMessages, modeId) {
+  const mid = modeId || selectedChatMode();
+  let messages = rawMessages;
+  let promptTokens = estimateMessagesTokens(messages);
+
+  // Dynamic context window / sliding window adjustment
+  const budget = await ensureDynamicContext(promptTokens, mid);
+  const reserve = getModePreset(mid).outputReserve || 512;
+  const fitBudget = Math.max(512, budget - reserve);
+
+  messages = fitMessagesToBudget(messages, fitBudget, mid);
+  promptTokens = estimateMessagesTokens(messages);
+
+  if (els.tokenMeterLabel) {
+    const draftLen = els.promptInput?.value?.length || 0;
+    els.tokenMeterLabel.textContent = `~${promptTokens.toLocaleString()} tok · window ${budget} · ${getModePreset(mid).label}`;
+    void draftLen;
+  }
+
+  writeLog(
+    `Context prep · ~${promptTokens} tok / window ${budget} · mode ${mid}`,
+    promptTokens > budget * CONTEXT_SOFT_RATIO ? 'warn' : 'info'
+  );
+  return { messages, promptTokens, budget, modeId: mid };
+}
+
+/**
+ * Error-fallback wrapper: retries on ContextWindowSizeExceededError with compression.
+ */
+async function runOneCompletion(messages, onDelta, modeId) {
+  const mid = modeId || selectedChatMode();
+  let prepared = await prepareMessagesForMode(messages, mid);
+  let attempt = 0;
+
+  while (attempt <= CONTEXT_OVERFLOW_RETRIES) {
+    try {
+      return await createCompletionOnce(prepared.messages, onDelta);
+    } catch (err) {
+      if (!isContextWindowError(err) || attempt >= CONTEXT_OVERFLOW_RETRIES) {
+        throw err;
+      }
+      writeLog(err.message || 'ContextWindowSizeExceededError', 'warn');
+      setStatus('Context full — compressing & retrying…', 'busy');
+      const fallbackMsgs = await fallbackAfterContextOverflow(
+        prepared.messages,
+        mid,
+        attempt
+      );
+      prepared = await prepareMessagesForMode(fallbackMsgs, mid);
+      attempt += 1;
+    }
+  }
+  throw new Error('Context window exceeded after fallback retries.');
 }
 
 async function sendPrompt(ev) {
@@ -934,6 +1765,7 @@ async function sendPrompt(ev) {
 
   const genStart = performance.now();
   const replyParts = [];
+  const modeId = selectedChatMode();
 
   try {
     for (let i = 0; i < parts.length; i++) {
@@ -946,19 +1778,25 @@ async function sendPrompt(ev) {
           ? parts[i]
           : `Analyze code chunk ${i + 1} of ${parts.length}. Focus on this segment only; later chunks continue the same file.\n\n\`\`\`\n${parts[i]}\n\`\`\``;
 
-      // For multi-chunk, don't re-send the entire chat history blob — lean messages
-      const messages =
-        parts.length === 1
-          ? buildMessages()
-          : [
-              {
-                role: 'system',
-                content: els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT,
-              },
-              { role: 'user', content: header },
-            ];
+      // code mode keeps chunked full-file parsing; writing/short use leaner history
+      let messages;
+      if (parts.length === 1) {
+        messages = buildMessages(undefined, modeId);
+      } else {
+        const preset = getModePreset(modeId);
+        const base = els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT;
+        const system = base.includes(preset.systemExtra)
+          ? base
+          : `${base}\n\n${preset.systemExtra}`;
+        messages = [
+          { role: 'system', content: system },
+          { role: 'user', content: header },
+        ];
+      }
 
-      const { reply, finishReason } = await runOneCompletion(messages, (partial) => {
+      const { reply, finishReason } = await runOneCompletion(
+        messages,
+        (partial) => {
         const shown =
           parts.length === 1
             ? partial
@@ -975,7 +1813,9 @@ async function sendPrompt(ev) {
           body.textContent = shown;
         }
         els.chat.scrollTop = els.chat.scrollHeight;
-      });
+      },
+        modeId
+      );
 
       if (parts.length > 1) {
         replyParts.push(`### Chunk ${i + 1}/${parts.length}\n\n${reply || '(empty)'}`);
@@ -1032,6 +1872,11 @@ async function sendPrompt(ev) {
         `Stack overflow blocked. Limit is ${limit.toLocaleString()} chars for this model — paste was auto-chunked or rejected. Try fewer lines per paste.`
       );
     }
+    if (isContextWindowError(err)) {
+      showPasteWarn(
+        'Context window was exceeded even after auto-compress. Try Short mode, clear chat, or paste a smaller slice.'
+      );
+    }
   } finally {
     generating = false;
     els.abortBtn.disabled = true;
@@ -1073,10 +1918,17 @@ async function eraseSessionUI() {
   setStatus('Idle', 'idle');
   setProvider('worker', 'Idle', false);
   els.chat.replaceChildren();
-  appendMsg('assistant', 'Session erased from memory. Nothing kept on disk.');
+  const kept = getKeptModels();
+  appendMsg(
+    'assistant',
+    kept.length
+      ? `Session erased from memory. ${kept.length} saved model(s) remain in local IndexedDB for fast reload.`
+      : 'Session erased from memory. No models are saved locally.'
+  );
   syncUndoButtons();
   updateTokenMeter();
   showBootError('');
+  await refreshModelCacheStatus();
 }
 
 function clearChat() {
@@ -1275,6 +2127,13 @@ function wireDualBootButtons() {
   els.bootBtnMain?.addEventListener('click', start);
   els.resetBtn?.addEventListener('click', stop);
   els.resetBtnMain?.addEventListener('click', stop);
+
+  const save = () => saveModelLocally().catch((e) => showBootError(e.message));
+  const remove = () => removeSavedModel().catch((e) => showBootError(e.message));
+  els.saveModelBtn?.addEventListener('click', save);
+  els.saveModelBtnAdv?.addEventListener('click', save);
+  els.removeModelBtn?.addEventListener('click', remove);
+  els.removeModelBtnAdv?.addEventListener('click', remove);
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,17 +2156,36 @@ els.clearLog?.addEventListener('click', () => {
   if (els.logBox) els.logBox.replaceChildren();
 });
 els.lengthSelect?.addEventListener('change', () => syncLabels());
+els.chatMode?.addEventListener('change', () => {
+  syncLabels();
+  if (!booted || !engine || !activeModelId) return;
+  const modeId = selectedChatMode();
+  const chatOpts = buildChatOptsForMode(modeId);
+  reloadEngineContext(chatOpts, modeId)
+    .then(() => writeLog(`Chat mode → ${modeId}`, 'info'))
+    .catch((e) => {
+      writeLog(`Mode switch failed: ${e.message}`, 'error');
+      showBootError(`Mode switch failed: ${e.message}`);
+    });
+});
 els.configMode?.addEventListener('change', () => {
   const manual = els.configMode.value === 'manual';
   if (els.modelSelect) els.modelSelect.disabled = !manual;
   if (els.categorySelect) els.categorySelect.disabled = !manual;
   syncLabels();
+  refreshModelCacheStatus().catch(() => {});
 });
 els.categorySelect?.addEventListener('change', () => {
   populateModelSelect(els.modelSelect?.value);
+  refreshModelCacheStatus().catch(() => {});
+});
+els.modelSelect?.addEventListener('change', () => {
+  refreshModelCacheStatus().catch(() => {});
 });
 els.refreshModels?.addEventListener('click', () => {
-  loadModelCatalog().catch((e) => showBootError(e.message));
+  loadModelCatalog()
+    .then(() => refreshModelCacheStatus())
+    .catch((e) => showBootError(e.message));
 });
 els.temperature?.addEventListener('input', () => {
   if (els.tempVal) els.tempVal.textContent = els.temperature.value;
@@ -1362,9 +2240,10 @@ setUiMode('simple');
 if (els.systemPrompt) els.systemPrompt.value = DEFAULT_SYSTEM_PROMPT;
 appendMsg(
   'assistant',
-  'Incognito mode: nothing is saved to disk. Press Start AI, then paste code or use a starter template.'
+  'Chat stays in RAM for this tab. Use Save Model Locally to keep weights in IndexedDB for faster next visits.'
 );
 syncUndoButtons();
+setModelCacheButtons({ canSave: true, canRemove: false, busy: false });
 
 fetch('./models.json')
   .then((r) => r.json())
@@ -1378,7 +2257,9 @@ fetch('./models.json')
   });
 
 probeWebGPU();
-loadModelCatalog().catch((e) => writeLog(`Catalog: ${e.message}`, 'warn'));
+loadModelCatalog()
+  .then(() => autoLoadIfCached())
+  .catch((e) => writeLog(`Catalog: ${e.message}`, 'warn'));
 
 // Show onboarding once per tab (sessionStorage is cleared on close — acceptable ephemeral)
 try {

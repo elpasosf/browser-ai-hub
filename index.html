@@ -3,27 +3,20 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Incognito-first browser AI hub. Zero storage. Local WebLLM. Nothing leaves your tab unless you export it." />
+  <meta name="description" content="On-device browser AI hub. Chat stays in RAM; optional local model cache for fast reloads." />
   <meta name="theme-color" content="#0a1018" />
   <meta name="referrer" content="no-referrer" />
   <meta http-equiv="Cache-Control" content="no-store" />
-  <meta property="og:title" content="Browser AI Hub — Incognito Local LLM" />
-  <meta property="og:description" content="Zero-storage, on-device chat. Simple or Advanced Engineer mode." />
+  <meta property="og:title" content="Browser AI Hub — Local LLM" />
+  <meta property="og:description" content="On-device chat with optional local model caching. Simple or Advanced Engineer mode." />
   <title>Browser AI Hub</title>
-  <link rel="stylesheet" href="style.css?v=9" />
+  <link rel="stylesheet" href="style.css?v=11" />
   <script>
     (function () {
+      // Drop stale service workers only — do not wipe Cache/IndexedDB model weights.
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.getRegistrations().then(function (r) {
           r.forEach(function (x) { x.unregister(); });
-        });
-      }
-      try {
-        localStorage.clear();
-      } catch (e) {}
-      if (window.caches && caches.keys) {
-        caches.keys().then(function (keys) {
-          keys.forEach(function (k) { caches.delete(k); });
         });
       }
     })();
@@ -36,7 +29,7 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <div>
           <h1>Browser AI Hub</h1>
-          <p class="brand-sub">Incognito local LLM · zero storage · no accounts</p>
+          <p class="brand-sub">On-device LLM · chat in RAM · optional local models</p>
         </div>
       </div>
       <div class="topbar-meta">
@@ -76,15 +69,17 @@
         <section class="panel" id="panel-start">
           <h2>Get started</h2>
           <p class="simple-lead">
-            On-device chat. Prompts and code stay in RAM for this tab only — wiped when you close it.
+            On-device chat. Prompts stay in RAM for this tab. Optionally save a model locally for faster startups.
           </p>
 
           <div class="templates" id="template-row" aria-label="Starter prompts"></div>
 
           <div class="auto-card">
             <div class="auto-row"><span>Recommended</span><strong id="auto-model-label">Loading…</strong></div>
+            <div class="auto-row"><span>Chat mode</span><strong id="auto-mode-label">Code</strong></div>
             <div class="auto-row"><span>Reply length</span><strong id="auto-length-label">Unlimited</strong></div>
-            <div class="auto-row"><span>Storage</span><strong id="auto-cache-label">RAM only</strong></div>
+            <div class="auto-row"><span>Context</span><strong id="auto-context-label">4096</strong></div>
+            <div class="auto-row"><span>Storage</span><strong id="auto-cache-label">Checking…</strong></div>
             <div class="auto-row"><span>Context use</span><strong id="token-meter-label">0 chars</strong></div>
           </div>
 
@@ -93,9 +88,18 @@
           </div>
 
           <label class="field">
+            <span>Chat mode</span>
+            <select id="chat-mode">
+              <option value="code" selected>Code — full / chunked context</option>
+              <option value="writing">Writing — long-form + sliding window</option>
+              <option value="short">Short — tight context, concise replies</option>
+            </select>
+          </label>
+
+          <label class="field">
             <span>Reply length</span>
             <select id="length-select">
-              <option value="unlimited" selected>Unlimited</option>
+              <option value="unlimited" selected>Unlimited (mode default)</option>
               <option value="short">Short (~256)</option>
               <option value="normal">Normal (~1024)</option>
               <option value="long">Long (~2048)</option>
@@ -104,8 +108,11 @@
 
           <div class="btn-stack">
             <button type="button" class="btn primary" id="boot-btn-main">Start AI</button>
+            <button type="button" class="btn ghost" id="save-model-btn">Save Model Locally</button>
+            <button type="button" class="btn ghost" id="remove-model-btn" disabled>Remove Saved Model</button>
             <button type="button" class="btn ghost" id="reset-btn-main" disabled>Stop &amp; erase session</button>
           </div>
+          <p class="cache-status" id="model-cache-status" aria-live="polite">Checking local model cache…</p>
           <p class="error-banner" id="boot-error" hidden></p>
           <div class="progress-block" style="margin-top:0.75rem">
             <div class="progress-meta">
@@ -121,9 +128,9 @@
         <div id="onboarding" class="panel onboard" hidden>
           <h2>Quick tour</h2>
           <ol class="onboard-steps">
-            <li>Press <strong>Start AI</strong> (downloads a model into memory for this tab).</li>
-            <li>Paste code or pick a starter template.</li>
-            <li>Close the tab anytime — everything is wiped.</li>
+            <li>Press <strong>Start AI</strong> to download a model (or auto-load if already saved).</li>
+            <li>Use <strong>Save Model Locally</strong> to keep weights in this browser for faster next visits.</li>
+            <li>Chat text is still wiped when you close the tab — only saved models persist.</li>
           </ol>
           <button type="button" class="btn tiny" id="dismiss-onboard">Got it</button>
         </div>
@@ -150,6 +157,11 @@
                 <option value="">Loading…</option>
               </select>
             </label>
+            <div class="btn-stack model-cache-actions">
+              <button type="button" class="btn ghost" id="save-model-btn-adv">Save Model Locally</button>
+              <button type="button" class="btn ghost" id="remove-model-btn-adv" disabled>Remove Saved Model</button>
+            </div>
+            <p class="cache-status" id="model-cache-status-adv" aria-live="polite"></p>
             <label class="field">
               <span>BYOK API key (session RAM only — optional)</span>
               <input type="password" id="byok-key" autocomplete="off" placeholder="Not required for local WebLLM" />
@@ -245,12 +257,13 @@
       <h2>No-telemetry guarantee</h2>
       <p>
         Chat text, prompts, and pasted code live in <strong>volatile memory</strong> for this tab.
-        Closing the tab runs an auto-wipe. We do not use analytics cookies or trackers.
+        Closing the tab wipes chat. We do not use analytics cookies or trackers.
       </p>
       <ul>
-        <li>No <code>localStorage</code> for chats or keys</li>
+        <li>No chat history in <code>localStorage</code></li>
         <li>BYOK keys stay in RAM for this session only</li>
-        <li>Model weights may download from Hugging Face / CDN only when you Start AI</li>
+        <li>Model weights download from Hugging Face / CDN when you Start AI or Save Model Locally</li>
+        <li>Opt-in: <strong>Save Model Locally</strong> keeps weights in IndexedDB for faster reloads</li>
         <li>Optional encrypted export is local-only (you choose a password)</li>
       </ul>
       <p>Use the <strong>Network auditor</strong> to inspect outgoing requests from this page.</p>
@@ -268,6 +281,6 @@
     <div id="auditor-list" class="auditor-list"></div>
   </aside>
 
-  <script type="module" src="app.js?v=9"></script>
+  <script type="module" src="app.js?v=11"></script>
 </body>
 </html>

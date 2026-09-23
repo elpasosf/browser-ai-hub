@@ -366,6 +366,30 @@ textarea {
   gap: 0.4rem;
 }
 
+.model-cache-actions {
+  margin: 0.35rem 0 0.15rem;
+}
+
+.cache-status {
+  margin: 0.45rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--text-dim);
+  min-height: 1.2em;
+}
+
+.cache-status[data-tone="ok"] {
+  color: var(--accent);
+}
+
+.cache-status[data-tone="busy"] {
+  color: var(--warn, #c9a227);
+}
+
+.cache-status[data-tone="error"] {
+  color: var(--danger, #d45d5d);
+}
+
 .btn {
   font: inherit;
   font-weight: 600;
