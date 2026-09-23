@@ -1105,7 +1105,7 @@ function updateTokenMeter() {
 
 /**
  * Safe message render for huge pastes — no recursive transforms.
- * Large bodies get a scrollable <pre> preview + expand.
+ * AI replies use Gemini-style fenced code blocks with Copy + light syntax highlight.
  */
 function appendMsg(role, text, meta) {
   const div = document.createElement('div');
@@ -1115,7 +1115,10 @@ function appendMsg(role, text, meta) {
   body.className = 'msg-body';
 
   const raw = text == null ? '' : String(text);
-  if (raw.length > PREVIEW_CHARS) {
+  const isAi = role !== 'user';
+  const hasFence = raw.indexOf('```') !== -1;
+
+  if (!isAi && raw.length > PREVIEW_CHARS && !hasFence) {
     const pre = document.createElement('pre');
     pre.className = 'msg-pre';
     pre.textContent = raw.slice(0, PREVIEW_CHARS) + '\n\n…';
@@ -1124,13 +1127,12 @@ function appendMsg(role, text, meta) {
     btn.className = 'btn tiny';
     btn.textContent = `Show all (${raw.length.toLocaleString()} chars)`;
     btn.addEventListener('click', () => {
-      // Assign in one shot — never recurse char-by-char
-      pre.textContent = raw;
+      renderMarkdownInto(body, raw, { allowHighlight: false });
       btn.remove();
     });
     body.append(pre, btn);
   } else {
-    body.textContent = raw;
+    renderMarkdownInto(body, raw, { allowHighlight: isAi || hasFence });
   }
   div.appendChild(body);
 
@@ -1143,6 +1145,433 @@ function appendMsg(role, text, meta) {
   els.chat.appendChild(div);
   els.chat.scrollTop = els.chat.scrollHeight;
   return { root: div, body };
+}
+
+// ---------------------------------------------------------------------------
+// Markdown / Gemini-style interactive code blocks
+// ---------------------------------------------------------------------------
+
+/** Split text into {type:'text'|'code', lang?, content} — iterative, no recursion. */
+function parseMarkdownSegments(text) {
+  const src = text == null ? '' : String(text);
+  const segments = [];
+  let i = 0;
+  let textStart = 0;
+  const len = src.length;
+
+  while (i < len) {
+    // Find opening fence at line start (or start of string)
+    if (
+      src.charCodeAt(i) === 96 &&
+      src.charCodeAt(i + 1) === 96 &&
+      src.charCodeAt(i + 2) === 96 &&
+      (i === 0 || src.charCodeAt(i - 1) === 10)
+    ) {
+      if (i > textStart) {
+        segments.push({ type: 'text', content: src.slice(textStart, i) });
+      }
+      let j = i + 3;
+      // language tag until newline
+      let langEnd = j;
+      while (langEnd < len && src.charCodeAt(langEnd) !== 10 && src.charCodeAt(langEnd) !== 13) {
+        langEnd += 1;
+      }
+      const lang = src.slice(j, langEnd).trim().toLowerCase().replace(/[^a-z0-9_+#.-]/g, '');
+      j = langEnd;
+      if (src.charCodeAt(j) === 13) j += 1;
+      if (src.charCodeAt(j) === 10) j += 1;
+      const codeStart = j;
+      // Find closing fence
+      let closed = false;
+      let k = codeStart;
+      while (k < len) {
+        if (
+          src.charCodeAt(k) === 96 &&
+          src.charCodeAt(k + 1) === 96 &&
+          src.charCodeAt(k + 2) === 96 &&
+          (k === 0 || src.charCodeAt(k - 1) === 10)
+        ) {
+          let code = src.slice(codeStart, k);
+          if (code.endsWith('\r\n')) code = code.slice(0, -2);
+          else if (code.endsWith('\n') || code.endsWith('\r')) code = code.slice(0, -1);
+          segments.push({ type: 'code', lang, content: code });
+          k += 3;
+          if (src.charCodeAt(k) === 13) k += 1;
+          if (src.charCodeAt(k) === 10) k += 1;
+          i = k;
+          textStart = k;
+          closed = true;
+          break;
+        }
+        k += 1;
+      }
+      if (!closed) {
+        // Streaming / incomplete fence — treat rest as open code block
+        segments.push({ type: 'code', lang, content: src.slice(codeStart), open: true });
+        textStart = len;
+        i = len;
+      }
+      continue;
+    }
+    i += 1;
+  }
+  if (textStart < len) {
+    segments.push({ type: 'text', content: src.slice(textStart) });
+  }
+  if (!segments.length) segments.push({ type: 'text', content: '' });
+  return segments;
+}
+
+const SYNTAX_KEYWORDS = {
+  js: 'const let var function return if else for while class async await import export from new this try catch throw typeof instanceof switch case break continue default of in void yield true false null undefined',
+  ts: 'const let var function return if else for while class async await import export from new this try catch throw typeof instanceof interface type enum implements extends public private protected readonly abstract as satisfies true false null undefined',
+  py: 'def class return if elif else for while import from as try except finally raise with pass break continue yield lambda True False None and or not in is global nonlocal async await',
+  java: 'public private protected class interface extends implements return if else for while try catch finally throw new static final void int long boolean String null true false import package',
+  go: 'func return if else for range package import var const type struct interface map chan go defer select case switch break continue true false nil',
+  rs: 'fn let mut return if else for while loop match struct enum impl trait pub use mod crate self super async await true false None Some Ok Err',
+  css: 'important media screen and or not only from to',
+  html: '',
+  sql: 'SELECT FROM WHERE JOIN LEFT RIGHT INNER OUTER ON GROUP BY ORDER HAVING INSERT UPDATE DELETE CREATE TABLE AS AND OR NOT NULL LIMIT OFFSET',
+  sh: 'if then else fi for do done while case esac function return echo export local true false',
+  bash: 'if then else fi for do done while case esac function return echo export local true false',
+  json: 'true false null',
+};
+
+function keywordSetFor(lang) {
+  const key =
+    lang === 'javascript' || lang === 'jsx' || lang === 'mjs' || lang === 'cjs'
+      ? 'js'
+      : lang === 'typescript' || lang === 'tsx'
+        ? 'ts'
+        : lang === 'python'
+          ? 'py'
+          : lang === 'rust'
+            ? 'rs'
+            : lang === 'shell' || lang === 'zsh'
+              ? 'bash'
+              : lang;
+  const list = SYNTAX_KEYWORDS[key] || SYNTAX_KEYWORDS.js;
+  const set = Object.create(null);
+  const parts = list.split(/\s+/);
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i]) set[parts[i]] = 1;
+  }
+  return set;
+}
+
+/**
+ * Lightweight syntax highlight into a <code> element (DOM spans, no innerHTML).
+ */
+function fillHighlightedCode(codeEl, code, lang) {
+  codeEl.replaceChildren();
+  if (!code) return;
+  const keywords = keywordSetFor(lang || 'js');
+  const isHtml = lang === 'html' || lang === 'xml' || lang === 'svg';
+  let i = 0;
+  const len = code.length;
+
+  const pushText = (text, cls) => {
+    if (!text) return;
+    if (cls) {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text;
+      codeEl.appendChild(span);
+    } else {
+      codeEl.appendChild(document.createTextNode(text));
+    }
+  };
+
+  while (i < len) {
+    const ch = code[i];
+    // Comments
+    if (ch === '/' && code[i + 1] === '/' && !isHtml) {
+      let j = i + 2;
+      while (j < len && code[j] !== '\n') j += 1;
+      pushText(code.slice(i, j), 'tok-comment');
+      i = j;
+      continue;
+    }
+    if (ch === '#' && (lang === 'py' || lang === 'python' || lang === 'sh' || lang === 'bash' || lang === 'shell')) {
+      let j = i + 1;
+      while (j < len && code[j] !== '\n') j += 1;
+      pushText(code.slice(i, j), 'tok-comment');
+      i = j;
+      continue;
+    }
+    if (ch === '/' && code[i + 1] === '*' && !isHtml) {
+      let j = i + 2;
+      while (j < len - 1 && !(code[j] === '*' && code[j + 1] === '/')) j += 1;
+      j = Math.min(len, j + 2);
+      pushText(code.slice(i, j), 'tok-comment');
+      i = j;
+      continue;
+    }
+    // Strings
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const quote = ch;
+      let j = i + 1;
+      while (j < len) {
+        if (code[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (code[j] === quote) {
+          j += 1;
+          break;
+        }
+        j += 1;
+      }
+      pushText(code.slice(i, j), 'tok-string');
+      i = j;
+      continue;
+    }
+    // HTML tags
+    if (isHtml && ch === '<') {
+      let j = i + 1;
+      while (j < len && code[j] !== '>') j += 1;
+      if (j < len) j += 1;
+      pushText(code.slice(i, j), 'tok-tag');
+      i = j;
+      continue;
+    }
+    // Numbers
+    if (ch >= '0' && ch <= '9') {
+      let j = i + 1;
+      while (j < len && ((code[j] >= '0' && code[j] <= '9') || code[j] === '.' || code[j] === '_')) j += 1;
+      pushText(code.slice(i, j), 'tok-number');
+      i = j;
+      continue;
+    }
+    // Identifiers / keywords
+    if (
+      (ch >= 'a' && ch <= 'z') ||
+      (ch >= 'A' && ch <= 'Z') ||
+      ch === '_' ||
+      ch === '$'
+    ) {
+      let j = i + 1;
+      while (
+        j < len &&
+        ((code[j] >= 'a' && code[j] <= 'z') ||
+          (code[j] >= 'A' && code[j] <= 'Z') ||
+          (code[j] >= '0' && code[j] <= '9') ||
+          code[j] === '_' ||
+          code[j] === '$')
+      ) {
+        j += 1;
+      }
+      const word = code.slice(i, j);
+      pushText(word, keywords[word] ? 'tok-kw' : '');
+      i = j;
+      continue;
+    }
+    pushText(ch, '');
+    i += 1;
+  }
+}
+
+async function copyCodeToClipboard(text, btn) {
+  let ok = false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand('copy');
+      ta.remove();
+    } catch {
+      ok = false;
+    }
+  }
+  if (!ok) {
+    btn.textContent = 'Failed';
+    setTimeout(() => {
+      btn.textContent = 'Copy';
+    }, 2000);
+    return;
+  }
+  btn.textContent = 'Copied!';
+  btn.classList.add('is-copied');
+  setTimeout(() => {
+    btn.textContent = 'Copy';
+    btn.classList.remove('is-copied');
+  }, 2000);
+}
+
+function createCodeBlock(lang, code, open) {
+  const wrap = document.createElement('div');
+  wrap.className = 'code-block' + (open ? ' is-streaming' : '');
+
+  const toolbar = document.createElement('div');
+  toolbar.className = 'code-block-toolbar';
+
+  const langEl = document.createElement('span');
+  langEl.className = 'code-block-lang';
+  langEl.textContent = lang || 'code';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'code-copy-btn';
+  copyBtn.textContent = 'Copy';
+  copyBtn.title = 'Copy code';
+  copyBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    copyCodeToClipboard(code, copyBtn);
+  });
+
+  toolbar.append(langEl, copyBtn);
+
+  const pre = document.createElement('pre');
+  pre.className = 'code-block-pre';
+  const codeEl = document.createElement('code');
+  if (lang) codeEl.className = `language-${lang}`;
+  // Cap highlight work on huge blocks to keep UI snappy
+  if (code.length <= 80_000) {
+    fillHighlightedCode(codeEl, code, lang);
+  } else {
+    codeEl.textContent = code;
+  }
+  pre.appendChild(codeEl);
+  wrap.append(toolbar, pre);
+  return wrap;
+}
+
+/** Render prose: paragraphs + inline `code` + light **bold** / *italic* / headings. */
+function renderTextBlock(text) {
+  const frag = document.createDocumentFragment();
+  const trimmed = text.replace(/^\n+|\n+$/g, '');
+  if (!trimmed) return frag;
+
+  const lines = trimmed.split('\n');
+  let para = [];
+
+  const flushPara = () => {
+    if (!para.length) return;
+    const p = document.createElement('p');
+    p.className = 'md-p';
+    fillInlineMarkdown(p, para.join('\n'));
+    frag.appendChild(p);
+    para = [];
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) {
+      flushPara();
+      const level = heading[1].length;
+      const h = document.createElement(level === 1 ? 'h3' : level === 2 ? 'h4' : 'h5');
+      h.className = 'md-h';
+      fillInlineMarkdown(h, heading[2]);
+      frag.appendChild(h);
+      continue;
+    }
+    if (/^\s*[-*]\s+/.test(line)) {
+      flushPara();
+      const li = document.createElement('div');
+      li.className = 'md-li';
+      fillInlineMarkdown(li, '• ' + line.replace(/^\s*[-*]\s+/, ''));
+      frag.appendChild(li);
+      continue;
+    }
+    if (line.trim() === '') {
+      flushPara();
+      continue;
+    }
+    para.push(line);
+  }
+  flushPara();
+  return frag;
+}
+
+function fillInlineMarkdown(el, text) {
+  // Iterative scan for `code`, **bold**, *italic*
+  let i = 0;
+  const len = text.length;
+  let buf = '';
+  const flush = () => {
+    if (!buf) return;
+    el.appendChild(document.createTextNode(buf));
+    buf = '';
+  };
+  while (i < len) {
+    if (text[i] === '`' ) {
+      let j = i + 1;
+      while (j < len && text[j] !== '`') j += 1;
+      if (j < len) {
+        flush();
+        const code = document.createElement('code');
+        code.className = 'md-inline-code';
+        code.textContent = text.slice(i + 1, j);
+        el.appendChild(code);
+        i = j + 1;
+        continue;
+      }
+    }
+    if (text[i] === '*' && text[i + 1] === '*') {
+      let j = i + 2;
+      while (j < len - 1 && !(text[j] === '*' && text[j + 1] === '*')) j += 1;
+      if (j < len - 1) {
+        flush();
+        const strong = document.createElement('strong');
+        strong.textContent = text.slice(i + 2, j);
+        el.appendChild(strong);
+        i = j + 2;
+        continue;
+      }
+    }
+    buf += text[i];
+    i += 1;
+  }
+  flush();
+}
+
+/**
+ * Render markdown into a container. Isolates fenced code into <pre><code> with Copy.
+ */
+function renderMarkdownInto(container, text, opts) {
+  if (!container) return;
+  const options = opts || {};
+  container.replaceChildren();
+  const raw = text == null ? '' : String(text);
+  if (!raw) {
+    container.appendChild(document.createTextNode(''));
+    return;
+  }
+
+  // Skip heavy parse for enormous plain dumps (no fences)
+  if (raw.length > PREVIEW_CHARS * 3 && raw.indexOf('```') === -1) {
+    const pre = document.createElement('pre');
+    pre.className = 'msg-pre';
+    pre.textContent = raw;
+    container.appendChild(pre);
+    return;
+  }
+
+  const segments = parseMarkdownSegments(raw);
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg.type === 'code') {
+      container.appendChild(createCodeBlock(seg.lang, seg.content, !!seg.open));
+    } else if (seg.content) {
+      container.appendChild(renderTextBlock(seg.content));
+    }
+  }
+  void options.allowHighlight;
 }
 
 function renderChatFromMemory() {
@@ -1797,23 +2226,16 @@ async function sendPrompt(ev) {
       const { reply, finishReason } = await runOneCompletion(
         messages,
         (partial) => {
-        const shown =
-          parts.length === 1
-            ? partial
-            : replyParts.length
-              ? joinStrings(replyParts) + '\n\n---\n\n' + partial
-              : `### Chunk ${i + 1}/${parts.length}\n\n` + partial;
-        if (shown.length > PREVIEW_CHARS) {
-          body.replaceChildren();
-          const pre = document.createElement('pre');
-          pre.className = 'msg-pre';
-          pre.textContent = shown.slice(-PREVIEW_CHARS);
-          body.appendChild(pre);
-        } else {
-          body.textContent = shown;
-        }
-        els.chat.scrollTop = els.chat.scrollHeight;
-      },
+          const shown =
+            parts.length === 1
+              ? partial
+              : replyParts.length
+                ? joinStrings(replyParts) + '\n\n---\n\n' + partial
+                : `### Chunk ${i + 1}/${parts.length}\n\n` + partial;
+          // Re-render markdown so open fences become live code blocks while streaming
+          renderMarkdownInto(body, shown, { allowHighlight: true });
+          els.chat.scrollTop = els.chat.scrollHeight;
+        },
         modeId
       );
 
@@ -1833,15 +2255,7 @@ async function sendPrompt(ev) {
 
     root.classList.remove('streaming');
     const fullReply = joinStrings(replyParts, '\n\n');
-    body.replaceChildren();
-    if (fullReply.length > PREVIEW_CHARS) {
-      const pre = document.createElement('pre');
-      pre.className = 'msg-pre';
-      pre.textContent = fullReply;
-      body.appendChild(pre);
-    } else {
-      body.textContent = fullReply || '(empty)';
-    }
+    renderMarkdownInto(body, fullReply || '(empty)', { allowHighlight: true });
 
     const latencyMs = Math.round(performance.now() - genStart);
     if (els.telLatency) els.telLatency.textContent = `${latencyMs} ms`;
