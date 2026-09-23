@@ -11,20 +11,7 @@ Assume the user is working on their own machine and projects, and wants practica
 const MAX_LOG = 200;
 const MAX_HISTORY = 12;
 
-const MODELS = {
-  tiny: { id: 'SmolLM2-360M-Instruct-q4f16_1-MLC', label: 'SmolLM2 360M (fastest)' },
-  small: { id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', label: 'Qwen2.5 0.5B (balanced)' },
-  medium: { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', label: 'Llama 3.2 1B (smarter)' },
-  large: { id: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', label: 'Qwen2.5 1.5B (best quality)' },
-};
-
 const LENGTH_TOKENS = { short: 256, normal: 1024, long: 2048 };
-
-const ALL_MODEL_IDS = [
-  ...Object.values(MODELS).map((m) => m.id),
-  'TinyLlama-1.1B-Chat-v1.0-q4f16_1-MLC',
-  'Phi-3.5-mini-instruct-q4f16_1-MLC-1k',
-];
 
 const $ = (id) => document.getElementById(id);
 
@@ -71,12 +58,18 @@ const els = {
   modeSimple: $('mode-simple'),
   modeAdvanced: $('mode-advanced'),
   bootError: $('boot-error'),
+  refreshModels: $('refresh-models'),
 };
 
 let CreateWebWorkerMLCEngine = null;
 let deleteModelAllInfoInCache = null;
 let prebuiltAppConfig = null;
+let ModelType = null;
 let webllmReady = null;
+
+/** @type {Array<{model_id:string,vram_required_MB?:number,low_resource_required?:boolean,model_type?:number}>} */
+let modelCatalog = [];
+let catalogLoaded = false;
 
 let engine = null;
 let booted = false;
@@ -96,6 +89,7 @@ async function ensureWebLLM() {
         CreateWebWorkerMLCEngine = m.CreateWebWorkerMLCEngine;
         deleteModelAllInfoInCache = m.deleteModelAllInfoInCache;
         prebuiltAppConfig = m.prebuiltAppConfig;
+        ModelType = m.ModelType;
         return true;
       })
       .catch((err) => {
@@ -106,7 +100,107 @@ async function ensureWebLLM() {
   return webllmReady;
 }
 
-async function purgeModelCaches(modelIds = ALL_MODEL_IDS) {
+function catalogIds() {
+  return modelCatalog.map((m) => m.model_id);
+}
+
+function isChatModel(rec) {
+  const t = rec.model_type;
+  if (t != null) {
+    const embed = ModelType?.embedding ?? 1;
+    const vlm = ModelType?.VLM ?? 2;
+    if (t === embed || t === vlm) return false;
+  }
+  const id = rec.model_id || '';
+  if (/embed|whisper|clip|binary/i.test(id)) return false;
+  return true;
+}
+
+function formatModelLabel(rec) {
+  const id = rec.model_id;
+  const vram = rec.vram_required_MB;
+  const vramTxt = vram != null ? ` · ~${Math.round(vram)} MB VRAM` : '';
+  const low = rec.low_resource_required ? ' · low-resource' : '';
+  return `${id}${vramTxt}${low}`;
+}
+
+function estimateVramBudgetMB() {
+  // Browser can't read dedicated VRAM reliably; use deviceMemory as a soft budget.
+  const memGB = navigator.deviceMemory || 8;
+  const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  if (mobile) return 1200;
+  // Leave headroom for browser + KV cache
+  return Math.round(memGB * 350);
+}
+
+function populateModelSelect(selectedId) {
+  if (!els.modelSelect) return;
+  const prev = selectedId || els.modelSelect.value;
+  els.modelSelect.innerHTML = '';
+  if (!modelCatalog.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = catalogLoaded ? 'No chat models found' : 'Loading model list…';
+    els.modelSelect.appendChild(opt);
+    return;
+  }
+  for (const rec of modelCatalog) {
+    const opt = document.createElement('option');
+    opt.value = rec.model_id;
+    opt.textContent = formatModelLabel(rec);
+    els.modelSelect.appendChild(opt);
+  }
+  if (prev && [...els.modelSelect.options].some((o) => o.value === prev)) {
+    els.modelSelect.value = prev;
+  }
+}
+
+async function loadModelCatalog() {
+  await ensureWebLLM();
+  const list = prebuiltAppConfig?.model_list || [];
+  modelCatalog = list
+    .filter(isChatModel)
+    .slice()
+    .sort((a, b) => (a.vram_required_MB || 9e9) - (b.vram_required_MB || 9e9));
+  catalogLoaded = true;
+  populateModelSelect(autoSelectModel()?.model_id);
+  syncAutoLabels();
+  writeLog(`Model catalog loaded · ${modelCatalog.length} chat models from WebLLM`, 'success');
+  return modelCatalog;
+}
+
+/**
+ * Auto-pick: largest chat model that fits estimated VRAM budget.
+ * Uses WebLLM metadata (vram_required_MB / low_resource_required) — not a hardcoded ID list.
+ */
+function autoSelectModel() {
+  if (!modelCatalog.length) {
+    return { model_id: '', label: 'Loading catalog…', vram_required_MB: null };
+  }
+  const budget = estimateVramBudgetMB();
+  const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  let pool = modelCatalog.filter((m) => (m.vram_required_MB || 0) <= budget);
+  if (mobile || (navigator.deviceMemory || 8) <= 4) {
+    const low = pool.filter((m) => m.low_resource_required);
+    if (low.length) pool = low;
+  }
+  if (!pool.length) {
+    // Fallback: smallest model in catalog
+    pool = [modelCatalog[0]];
+  }
+  // Prefer the strongest (highest VRAM) that still fits
+  pool.sort((a, b) => (b.vram_required_MB || 0) - (a.vram_required_MB || 0));
+  const pick = pool[0];
+  return {
+    ...pick,
+    id: pick.model_id,
+    label: formatModelLabel(pick),
+  };
+}
+
+async function purgeModelCaches(modelIds) {
+  const ids = modelIds?.length ? modelIds : catalogIds();
+  if (!ids.length) return;
   if (!deleteModelAllInfoInCache || !prebuiltAppConfig) {
     try {
       await ensureWebLLM();
@@ -114,7 +208,7 @@ async function purgeModelCaches(modelIds = ALL_MODEL_IDS) {
       return;
     }
   }
-  for (const id of [...new Set(modelIds.filter(Boolean))]) {
+  for (const id of [...new Set(ids.filter(Boolean))]) {
     try {
       await deleteModelAllInfoInCache(id, prebuiltAppConfig);
     } catch {
@@ -151,7 +245,9 @@ async function purgeSessionArtifacts() {
     }
     booted = false;
     generating = false;
-    await purgeModelCaches(activeModelId ? [activeModelId, ...ALL_MODEL_IDS] : ALL_MODEL_IDS);
+    await purgeModelCaches(
+      activeModelId ? [activeModelId, ...catalogIds()] : catalogIds()
+    );
     activeModelId = null;
   } finally {
     purging = false;
@@ -229,15 +325,6 @@ function appendMsg(role, text, meta) {
   return div;
 }
 
-function autoSelectModel() {
-  const mem = navigator.deviceMemory || 8;
-  const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-  if (mobile || mem <= 4) return MODELS.tiny;
-  if (mem <= 8) return MODELS.small;
-  if (mem <= 16) return MODELS.medium;
-  return MODELS.large;
-}
-
 function resolveMaxTokens() {
   const override = Number(els.maxTokensOverride?.value || 0);
   if (override > 0) return override;
@@ -246,7 +333,11 @@ function resolveMaxTokens() {
 
 function syncAutoLabels() {
   const rec = autoSelectModel();
-  if (els.autoModelLabel) els.autoModelLabel.textContent = rec.label;
+  if (els.autoModelLabel) {
+    els.autoModelLabel.textContent = catalogLoaded
+      ? rec.label || rec.model_id || '—'
+      : 'Loading catalog…';
+  }
   const labels = {
     short: 'Short (~256 tokens)',
     normal: 'Normal (~1024 tokens)',
@@ -257,8 +348,8 @@ function syncAutoLabels() {
   }
   if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'None · session only';
   if (els.oom) els.oom.textContent = `${resolveMaxTokens()} tokens`;
-  if ((els.configMode?.value || 'auto') === 'auto' && els.modelSelect) {
-    els.modelSelect.value = rec.id;
+  if ((els.configMode?.value || 'auto') === 'auto' && els.modelSelect && rec.model_id) {
+    els.modelSelect.value = rec.model_id;
   }
 }
 
@@ -333,8 +424,10 @@ function onInitProgress(report) {
 }
 
 function selectedModelId() {
-  if ((els.configMode?.value || 'auto') === 'auto') return autoSelectModel().id;
-  return els.modelSelect.value;
+  if ((els.configMode?.value || 'auto') === 'auto') {
+    return autoSelectModel().model_id;
+  }
+  return els.modelSelect?.value || autoSelectModel().model_id;
 }
 
 async function loadLLM() {
@@ -351,6 +444,7 @@ async function loadLLM() {
 
   try {
     await ensureWebLLM();
+    if (!catalogLoaded) await loadModelCatalog();
   } catch (err) {
     showBootError(`Could not load AI engine from CDN: ${err.message}. Check network / ad-blockers.`);
     writeLog(`WebLLM import failed: ${err.message}`, 'error');
@@ -361,6 +455,11 @@ async function loadLLM() {
   }
 
   const modelId = selectedModelId();
+  if (!modelId) {
+    showBootError('No model selected. Wait for the catalog to load, or pick one in Advanced → Manual.');
+    els.bootBtn.disabled = false;
+    return;
+  }
   if (els.modelSelect) els.modelSelect.value = modelId;
   writeLog(`Loading (temporary): ${modelId}`, 'info');
 
@@ -583,6 +682,17 @@ els.configMode?.addEventListener('change', () => {
   syncAutoLabels();
 });
 els.maxTokensOverride?.addEventListener('change', () => syncAutoLabels());
+els.refreshModels?.addEventListener('click', () => {
+  els.refreshModels.disabled = true;
+  loadModelCatalog()
+    .catch((e) => {
+      showBootError(`Catalog refresh failed: ${e.message}`);
+      writeLog(`Catalog refresh failed: ${e.message}`, 'error');
+    })
+    .finally(() => {
+      els.refreshModels.disabled = false;
+    });
+});
 
 window.addEventListener('pagehide', () => {
   purgeSessionArtifacts();
@@ -596,5 +706,9 @@ window.addEventListener('unhandledrejection', (e) => {
 setUiMode('simple');
 syncAutoLabels();
 setStatus('Idle', 'idle');
-writeLog('UI ready. Press Start AI when you want to load a model.', 'info');
+writeLog('UI ready. Loading WebLLM model catalog…', 'info');
 probeWebGPU();
+loadModelCatalog().catch((e) => {
+  writeLog(`Catalog preload failed (will retry on Start): ${e.message}`, 'warn');
+  if (els.autoModelLabel) els.autoModelLabel.textContent = 'Catalog unavailable — retry Start';
+});
