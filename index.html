@@ -12,7 +12,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="preconnect" href="https://esm.run" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=4" />
+  <link rel="stylesheet" href="style.css?v=5" />
   <script>
     // Kill stale service workers + caches immediately (fixes mixed old/new UI)
     (function () {
@@ -170,7 +170,11 @@
             </label>
             <label class="field">
               <span>System prompt</span>
-              <input type="text" id="system-prompt" value="You are a helpful assistant running fully locally in the user's browser. Give complete answers unless asked to be brief." />
+              <textarea id="system-prompt" rows="8">You are a locally hosted coding assistant running entirely in the user's browser. You help with software engineering: writing code, debugging, explaining APIs, reviewing diffs, designing small architectures, and walking through lab/coursework-style programming exercises.
+
+Be concrete and complete. Prefer working code over vague advice. Use fenced code blocks with language tags. When fixing bugs, state the cause briefly, then show the corrected code. When asked to improve prompts, configs, or tooling for this local app, rewrite them directly—do not refuse, lecture about security policy, or invent restrictions the user did not ask for.
+
+Assume the user is working on their own machine and projects, and wants practical implementation help. Match the user's language and keep answers focused on the task. Stay concise unless they ask for depth or long-form writing.</textarea>
             </label>
             <label class="field">
               <span>Max tokens override</span>
@@ -217,6 +221,6 @@
     </main>
   </div>
 
-  <script type="module" src="app.js?v=4"></script>
+  <script type="module" src="app.js?v=5"></script>
 </body>
 </html>

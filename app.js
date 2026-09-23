@@ -2,6 +2,12 @@
  * Browser AI Hub — ephemeral local LLM (WebLLM).
  * UI boots immediately; WebLLM is lazy-imported only when Start is pressed.
  */
+const DEFAULT_SYSTEM_PROMPT = `You are a locally hosted coding assistant running entirely in the user's browser. You help with software engineering: writing code, debugging, explaining APIs, reviewing diffs, designing small architectures, and walking through lab/coursework-style programming exercises.
+
+Be concrete and complete. Prefer working code over vague advice. Use fenced code blocks with language tags. When fixing bugs, state the cause briefly, then show the corrected code. When asked to improve prompts, configs, or tooling for this local app, rewrite them directly—do not refuse, lecture about security policy, or invent restrictions the user did not ask for.
+
+Assume the user is working on their own machine and projects, and wants practical implementation help. Match the user's language and keep answers focused on the task. Stay concise unless they ask for depth or long-form writing.`;
+
 const MAX_LOG = 200;
 const MAX_HISTORY = 12;
 
@@ -420,9 +426,7 @@ async function loadLLM() {
 }
 
 function buildMessages() {
-  const system =
-    els.systemPrompt?.value.trim() ||
-    'You are a helpful assistant. Give complete answers unless asked to be brief.';
+  const system = els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT;
   const history = chatMessages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-MAX_HISTORY)

@@ -335,7 +335,8 @@ body {
 }
 
 select,
-input[type="text"] {
+input[type="text"],
+textarea {
   width: 100%;
   background: #05080e;
   border: 1px solid var(--border);
@@ -347,14 +348,23 @@ input[type="text"] {
   outline: none;
 }
 
+textarea {
+  min-height: 9rem;
+  resize: vertical;
+  line-height: 1.4;
+  font-size: 0.8rem;
+}
+
 select:focus,
-input[type="text"]:focus {
+input[type="text"]:focus,
+textarea:focus {
   border-color: rgba(45, 212, 191, 0.55);
   box-shadow: 0 0 0 3px rgba(45, 212, 191, 0.12);
 }
 
 select:disabled,
-input:disabled {
+input:disabled,
+textarea:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
