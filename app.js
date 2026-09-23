@@ -1,12 +1,21 @@
 /**
  * Browser AI Hub — WebLLM local chat with Simple (auto) + Advanced modes.
+ * Privacy: NOTHING is persisted. Chat, prefs, and model weights are session-only.
  */
-import { CreateWebWorkerMLCEngine } from 'https://esm.run/@mlc-ai/web-llm';
+import {
+  CreateWebWorkerMLCEngine,
+  deleteModelAllInfoInCache,
+  prebuiltAppConfig,
+} from 'https://esm.run/@mlc-ai/web-llm';
 
-const PREFS_KEY = 'bah.webllm.prefs.v2';
-const CHAT_KEY = 'bah.webllm.chat.v1';
 const MAX_LOG = 220;
 const MAX_HISTORY = 12;
+const LEGACY_KEYS = [
+  'bah.webllm.prefs.v1',
+  'bah.webllm.prefs.v2',
+  'bah.webllm.chat.v1',
+  'bah.prefs.v1',
+];
 
 const MODELS = {
   tiny: {
@@ -32,6 +41,12 @@ const LENGTH_TOKENS = {
   normal: 1024,
   long: 2048,
 };
+
+const ALL_MODEL_IDS = [
+  ...Object.values(MODELS).map((m) => m.id),
+  'TinyLlama-1.1B-Chat-v1.0-q4f16_1-MLC',
+  'Phi-3.5-mini-instruct-q4f16_1-MLC-1k',
+];
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -89,29 +104,80 @@ let tokenCount = 0;
 let genStart = 0;
 let uiMode = 'simple';
 let recommended = MODELS.medium;
+let activeModelId = null;
+let purging = false;
 
-function loadPrefs() {
-  try {
-    return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}');
-  } catch {
-    return {};
+function scrubLegacyStorage() {
+  for (const k of LEGACY_KEYS) {
+    try {
+      localStorage.removeItem(k);
+    } catch {
+      /* ignore */
+    }
+    try {
+      sessionStorage.removeItem(k);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
-function savePrefs(patch) {
-  localStorage.setItem(PREFS_KEY, JSON.stringify({ ...loadPrefs(), ...patch }));
-}
-
-function loadChat() {
+async function purgeModelCaches(modelIds = ALL_MODEL_IDS) {
+  const ids = [...new Set(modelIds.filter(Boolean))];
+  for (const id of ids) {
+    try {
+      await deleteModelAllInfoInCache(id, prebuiltAppConfig);
+    } catch {
+      /* ignore */
+    }
+  }
   try {
-    return JSON.parse(localStorage.getItem(CHAT_KEY) || '[]');
+    const keys = await caches.keys();
+    await Promise.all(
+      keys
+        .filter((k) => /bah-|webllm|mlc|web-ai|browser-ai/i.test(k))
+        .map((k) => caches.delete(k))
+    );
   } catch {
-    return [];
+    /* ignore */
   }
 }
 
-function saveChat() {
-  localStorage.setItem(CHAT_KEY, JSON.stringify(chatMessages.slice(-40)));
+async function unregisterServiceWorkers() {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map((r) => r.unregister()));
+  } catch {
+    /* ignore */
+  }
+}
+
+async function purgeSessionArtifacts() {
+  if (purging) return;
+  purging = true;
+  try {
+    chatMessages = [];
+    if (engine) {
+      try {
+        await engine.interruptGenerate();
+      } catch {
+        /* ignore */
+      }
+      try {
+        await engine.unload();
+      } catch {
+        /* ignore */
+      }
+      engine = null;
+    }
+    booted = false;
+    generating = false;
+    await purgeModelCaches(activeModelId ? [activeModelId, ...ALL_MODEL_IDS] : ALL_MODEL_IDS);
+    activeModelId = null;
+  } finally {
+    purging = false;
+  }
 }
 
 function writeLog(message, level = 'info') {
@@ -174,7 +240,6 @@ function appendMsg(role, text, meta) {
   return div;
 }
 
-/** Auto-pick model from device memory / mobile */
 function autoSelectModel() {
   const mem = navigator.deviceMemory || 8;
   const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
@@ -202,10 +267,8 @@ function syncAutoLabels() {
     long: 'Long (~2048 tokens)',
   };
   if (els.autoLengthLabel) els.autoLengthLabel.textContent = labels[len] || labels.normal;
-  if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'This browser only';
+  if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'None · session only';
   if (els.oom) els.oom.textContent = `${resolveMaxTokens()} max tokens`;
-
-  // In Auto config, keep select aligned with recommendation
   if ((els.configMode?.value || 'auto') === 'auto') {
     els.modelSelect.value = rec.id;
   }
@@ -217,7 +280,6 @@ function setUiMode(mode) {
   els.modeSimple?.classList.toggle('active', uiMode === 'simple');
   els.modeAdvanced?.classList.toggle('active', uiMode === 'advanced');
   if (els.advancedPanels) els.advancedPanels.hidden = uiMode !== 'advanced';
-  savePrefs({ uiMode });
 }
 
 async function probeWebGPU() {
@@ -270,16 +332,11 @@ async function probeWebGPU() {
 function onInitProgress(report) {
   const pct = (report.progress ?? 0) * 100;
   const text = report.text || 'Loading model…';
-  const friendly = /cache|Cached|Fetch cache/i.test(text)
-    ? 'Loading from your browser cache…'
-    : /download|Fetch|Loading/i.test(text)
-      ? text
-      : text;
-  updateProgress(pct, friendly);
+  updateProgress(pct, text);
   if (els.telCache) {
     els.telCache.textContent = text.length > 48 ? `${text.slice(0, 48)}…` : text;
   }
-  setStatus(pct >= 100 ? 'Almost ready…' : /cache/i.test(text) ? 'Loading from cache' : 'Downloading model', 'busy');
+  setStatus(pct >= 100 ? 'Almost ready…' : 'Loading into memory…', 'busy');
   if (pct === 0 || pct >= 99 || Math.round(pct) % 15 === 0) {
     writeLog(text, pct >= 99 ? 'success' : 'info');
   }
@@ -298,13 +355,6 @@ async function loadLLM() {
 
   const modelId = selectedModelId();
   els.modelSelect.value = modelId;
-  savePrefs({
-    modelId,
-    system: els.systemPrompt.value,
-    length: els.lengthSelect.value,
-    configMode: els.configMode?.value || 'auto',
-    maxTokensOverride: els.maxTokensOverride?.value || '0',
-  });
 
   els.bootBtn.disabled = true;
   els.modelSelect.disabled = true;
@@ -313,8 +363,8 @@ async function loadLLM() {
   setStatus('Starting…', 'busy');
   updateProgress(2, 'Starting AI engine…');
   setProvider('worker', 'Starting', true);
-  writeLog(`Loading: ${modelId}`, 'info');
-  writeLog('First visit downloads weights into THIS browser. Later visits reuse Cache API (not GitHub).', 'warn');
+  writeLog(`Loading (temporary): ${modelId}`, 'info');
+  writeLog('Session-only: chat & model files erased when you leave or stop.', 'warn');
 
   try {
     if (engine) {
@@ -325,6 +375,7 @@ async function loadLLM() {
       }
       engine = null;
     }
+    await purgeModelCaches([modelId]);
 
     engine = await CreateWebWorkerMLCEngine(
       new Worker(new URL('./llm-worker.js', import.meta.url), { type: 'module' }),
@@ -333,6 +384,7 @@ async function loadLLM() {
     );
 
     booted = true;
+    activeModelId = modelId;
     if (els.modelBadge) els.modelBadge.textContent = modelId.replace(/-MLC.*$/, '');
     updateProgress(100, 'Ready — start chatting');
     setStatus('Ready', 'ok');
@@ -346,7 +398,7 @@ async function loadLLM() {
     els.bootBtn.disabled = false;
     els.modelSelect.disabled = false;
     els.systemPrompt.disabled = false;
-    els.promptInput.placeholder = 'Ask anything…';
+    els.promptInput.placeholder = 'Ask anything… (not saved)';
     els.promptInput.focus();
 
     try {
@@ -354,17 +406,17 @@ async function loadLLM() {
       if (els.telBytes) els.telBytes.textContent = String(stats).slice(0, 42);
       writeLog(`Runtime: ${stats}`, 'success');
     } catch {
-      if (els.telBytes) els.telBytes.textContent = 'WebGPU · browser cache';
+      if (els.telBytes) els.telBytes.textContent = 'WebGPU · RAM only';
     }
 
     appendMsg(
       'assistant',
-      `Ready. Using ${modelId.split('-').slice(0, 3).join(' ')}. Reply length: ${els.lengthSelect.value} (up to ${resolveMaxTokens()} tokens). Ask for long essays with length set to Long if needed.`
+      `Ready with ${modelId.split('-').slice(0, 3).join(' ')}. Nothing is saved — chat and model data are temporary for this tab only.`
     );
-    writeLog('Local LLM ready.', 'success');
+    writeLog('Local LLM ready (ephemeral session).', 'success');
   } catch (err) {
     writeLog(`Load failed: ${err.message || err}`, 'error');
-    writeLog('Tip: switch to Advanced → smaller model, or close other GPU apps.', 'warn');
+    writeLog('Tip: Advanced → smaller model, or close other GPU apps.', 'warn');
     setStatus('Couldn’t start', 'error');
     setProvider('worker', 'Error', false);
     els.bootBtn.disabled = false;
@@ -373,6 +425,7 @@ async function loadLLM() {
     els.bootBtn.textContent = 'Try again';
     engine = null;
     booted = false;
+    activeModelId = null;
   }
 }
 
@@ -395,7 +448,6 @@ async function sendPrompt(ev) {
 
   appendMsg('user', query);
   chatMessages.push({ role: 'user', content: query });
-  saveChat();
 
   els.promptInput.value = '';
   generating = true;
@@ -467,7 +519,6 @@ async function sendPrompt(ev) {
     bubble.appendChild(m);
 
     chatMessages.push({ role: 'assistant', content: reply || '(empty)' });
-    saveChat();
     setStatus('Ready', 'ok');
     writeLog(`Done · reason=${finishReason || 'stop'} · ${tps} tok/s`, 'success');
   } catch (err) {
@@ -495,15 +546,27 @@ async function abortGen() {
 }
 
 async function unloadLLM() {
-  writeLog('Freeing GPU memory…', 'warn');
+  writeLog('Ending session — clearing chat + model cache…', 'warn');
+  const model = activeModelId;
+  chatMessages = [];
   try {
-    if (engine) await engine.unload();
+    if (engine) {
+      try {
+        await engine.interruptGenerate();
+      } catch {
+        /* ignore */
+      }
+      await engine.unload();
+    }
   } catch {
     /* ignore */
   }
   engine = null;
   booted = false;
   generating = false;
+  await purgeModelCaches(model ? [model, ...ALL_MODEL_IDS] : ALL_MODEL_IDS);
+  activeModelId = null;
+
   els.promptInput.disabled = true;
   els.sendBtn.disabled = true;
   els.abortBtn.disabled = true;
@@ -514,23 +577,24 @@ async function unloadLLM() {
   updateProgress(0, 'Ready when you are');
   setStatus('Idle', 'idle');
   setProvider('worker', 'Idle', false);
+  els.chat.innerHTML = '';
   appendMsg(
     'assistant',
-    'AI stopped and GPU memory freed. The model file usually stays in your browser cache for a fast restart.'
+    'Session cleared. Chat history and model files were removed. Nothing was kept on disk.'
   );
 }
 
 function clearChat() {
   chatMessages = [];
-  saveChat();
   els.chat.innerHTML = '';
-  appendMsg('assistant', 'New chat started. Cached model weights are unchanged.');
+  appendMsg('assistant', 'Chat wiped from memory. Nothing was written to disk.');
+  if (engine) {
+    engine.resetChat?.().catch(() => {});
+  }
 }
 
-// --- UI mode ---
 els.modeSimple?.addEventListener('click', () => setUiMode('simple'));
 els.modeAdvanced?.addEventListener('click', () => setUiMode('advanced'));
-
 els.bootBtn.addEventListener('click', () => loadLLM());
 els.resetBtn.addEventListener('click', () => unloadLLM());
 els.clearCacheBtn?.addEventListener('click', () => unloadLLM());
@@ -541,20 +605,12 @@ els.clearLog?.addEventListener('click', () => {
   writeLog('Console cleared', 'info');
 });
 els.clearChat.addEventListener('click', () => clearChat());
-els.lengthSelect?.addEventListener('change', () => {
-  savePrefs({ length: els.lengthSelect.value });
-  syncAutoLabels();
-});
+els.lengthSelect?.addEventListener('change', () => syncAutoLabels());
 els.configMode?.addEventListener('change', () => {
-  savePrefs({ configMode: els.configMode.value });
   syncAutoLabels();
   els.modelSelect.disabled = els.configMode.value === 'auto';
 });
-els.modelSelect?.addEventListener('change', () => savePrefs({ modelId: els.modelSelect.value }));
-els.maxTokensOverride?.addEventListener('change', () => {
-  savePrefs({ maxTokensOverride: els.maxTokensOverride.value });
-  syncAutoLabels();
-});
+els.maxTokensOverride?.addEventListener('change', () => syncAutoLabels());
 
 window.addEventListener('unhandledrejection', (e) => {
   e.preventDefault();
@@ -562,31 +618,21 @@ window.addEventListener('unhandledrejection', (e) => {
   setStatus('Error', 'error');
 });
 
-// restore
-const prefs = loadPrefs();
-if (prefs.length) els.lengthSelect.value = prefs.length;
-if (prefs.configMode) els.configMode.value = prefs.configMode;
-if (prefs.maxTokensOverride) els.maxTokensOverride.value = prefs.maxTokensOverride;
-if (prefs.modelId) els.modelSelect.value = prefs.modelId;
-if (prefs.system) els.systemPrompt.value = prefs.system;
+window.addEventListener('pagehide', () => {
+  purgeSessionArtifacts();
+});
+window.addEventListener('beforeunload', () => {
+  purgeSessionArtifacts();
+});
+
+scrubLegacyStorage();
+unregisterServiceWorkers();
 els.modelSelect.disabled = (els.configMode?.value || 'auto') === 'auto';
-setUiMode(prefs.uiMode || 'simple');
-
-const prior = loadChat();
-if (prior.length) {
-  chatMessages = prior;
-  els.chat.innerHTML = '';
-  for (const m of chatMessages) appendMsg(m.role, m.content);
-}
-
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
-  });
-}
+setUiMode('simple');
 
 requestAnimationFrame(() => {
-  writeLog('Browser AI Hub ready', 'info');
+  writeLog('Ephemeral mode: no chat history, no prefs, no lasting model cache.', 'warn');
   syncAutoLabels();
   probeWebGPU();
+  purgeModelCaches().then(() => writeLog('Prior model caches cleared.', 'success'));
 });

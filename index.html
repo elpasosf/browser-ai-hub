@@ -20,7 +20,7 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <div>
           <h1>Browser AI Hub</h1>
-          <p class="brand-sub">Your private AI · runs in this browser · no account</p>
+          <p class="brand-sub">Temporary local LLM · nothing saved · no account</p>
         </div>
       </div>
       <div class="topbar-meta">
@@ -28,7 +28,7 @@
           <button type="button" class="mode-btn active" data-mode="simple" id="mode-simple">Simple</button>
           <button type="button" class="mode-btn" data-mode="advanced" id="mode-advanced">Advanced</button>
         </div>
-        <span class="pill" id="pill-privacy" data-tone="ok">Private · on this device</span>
+        <span class="pill" id="pill-privacy" data-tone="ok">Temporary · nothing saved</span>
         <span class="pill" id="pill-backend" data-tone="idle">GPU: —</span>
         <span class="pill" id="pill-status" data-tone="idle">
           <span class="live-dot"></span>
@@ -43,12 +43,12 @@
         <section class="panel simple-only">
           <h2>Get started</h2>
           <p class="simple-lead" id="simple-lead">
-            We’ll pick a model that fits this computer and save it in your browser so the next visit is fast.
+            We’ll pick a model that fits this computer. Nothing is saved — chats and downloads are temporary for this visit only.
           </p>
           <div class="auto-card" id="auto-card">
             <div class="auto-row"><span>Recommended model</span><strong id="auto-model-label">Detecting…</strong></div>
             <div class="auto-row"><span>Reply length</span><strong id="auto-length-label">Normal (essays OK)</strong></div>
-            <div class="auto-row"><span>Cache</span><strong id="auto-cache-label">On this device only</strong></div>
+            <div class="auto-row"><span>Storage</span><strong id="auto-cache-label">None · session only</strong></div>
           </div>
           <label class="field">
             <span>How long should answers be?</span>
@@ -59,11 +59,10 @@
             </select>
           </label>
           <button type="button" class="btn primary btn-block" id="boot-btn">Start AI</button>
-          <button type="button" class="btn ghost btn-block" id="reset-btn" disabled style="margin-top:0.45rem">Stop &amp; free memory</button>
+          <button type="button" class="btn ghost btn-block" id="reset-btn" disabled style="margin-top:0.45rem">Stop &amp; erase session</button>
           <p class="privacy-note" style="margin-top:0.75rem">
-            <strong>First time:</strong> downloads the model once (a few minutes).<br />
-            <strong>Next times:</strong> loads from <em>your</em> browser cache — not from GitHub.
-            Models are too large to store in the GitHub repo.
+            <strong>Temporary by design:</strong> chat is never saved. Model files are cleared when you stop or close this tab.
+            Closing the page wipes the session.
           </p>
         </section>
 
@@ -155,7 +154,7 @@
                 <option value="2048">2048</option>
               </select>
             </label>
-            <button type="button" class="btn danger btn-block" id="clear-cache-btn">Free GPU memory</button>
+            <button type="button" class="btn danger btn-block" id="clear-cache-btn">Erase session + model files</button>
           </section>
 
           <section class="panel console-panel">
@@ -180,7 +179,7 @@
             </div>
           </div>
           <p class="hint" id="cache-hint" style="margin-top:0.55rem">
-            Cache lives in <strong>your browser</strong> (Cache API). GitHub only hosts the tiny app files — not the model weights.
+            No lasting storage. Chat lives in RAM for this tab only; model downloads are deleted when you stop or leave.
           </p>
         </section>
       </aside>
@@ -193,7 +192,7 @@
           </div>
           <div class="chat-box" id="chat-viewport" aria-live="polite">
             <div class="msg ai">
-              Press <strong>Start AI</strong> on the left. The first run downloads a model into this browser; later runs reuse that cache. Your chats stay on this device.
+              Press <strong>Start AI</strong>. Chats are never written to disk. Closing the tab or pressing Stop erases the session (including temporary model files).
             </div>
           </div>
           <form class="input-row" id="prompt-form">
