@@ -1,0 +1,61 @@
+{
+  "categories": [
+    {
+      "id": "fast",
+      "label": "Fast Generalist",
+      "match": ["0.5B", "360M", "1B", "TinyLlama", "SmolLM", "Qwen2.5-0.5", "Llama-3.2-1B"]
+    },
+    {
+      "id": "coding",
+      "label": "Heavy Coding",
+      "match": ["Coder", "code", "DeepSeek", "Qwen2.5-1.5", "Qwen2.5-3B", "Phi-3", "Phi-3.5", "Hermes"]
+    },
+    {
+      "id": "context",
+      "label": "Massive Context",
+      "match": ["128k", "1M", "32k", "64k", "longctx", "YaRN"]
+    },
+    {
+      "id": "agent",
+      "label": "Specialized / Chat",
+      "match": ["Instruct", "Chat", "Hermes", "OpenHermes", "Neural"]
+    },
+    {
+      "id": "other",
+      "label": "Other Models",
+      "match": []
+    }
+  ],
+  "templates": [
+    {
+      "id": "summarize",
+      "label": "Summarize",
+      "prompt": "Summarize the following clearly in plain language:\n\n"
+    },
+    {
+      "id": "email",
+      "label": "Draft email",
+      "prompt": "Draft a clear, professional email about:\n\n"
+    },
+    {
+      "id": "explain",
+      "label": "Explain simply",
+      "prompt": "Explain this like I'm new to the topic:\n\n"
+    },
+    {
+      "id": "debug",
+      "label": "Debug code",
+      "prompt": "Find the bug and show a corrected version. Code:\n\n"
+    },
+    {
+      "id": "review",
+      "label": "Review code",
+      "prompt": "Review this code for bugs and improvements:\n\n"
+    },
+    {
+      "id": "analyze",
+      "label": "Analyze paste",
+      "prompt": "Analyze the following code. Explain what it does, note risks, and suggest improvements:\n\n"
+    }
+  ]
+}
