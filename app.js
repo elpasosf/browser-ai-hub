@@ -11,6 +11,8 @@ Assume the user is working on their own machine and projects, and wants practica
 const MAX_LOG = 160;
 const LENGTH_TOKENS = { short: 256, normal: 1024, long: 2048, unlimited: null };
 const PREVIEW_CHARS = 4000;
+/** Absolute ceiling — never accept a single paste larger than this (browser safety). */
+const HARD_PASTE_CEILING = 500_000;
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -79,6 +81,7 @@ const els = {
   themeSelect: $('theme-select'),
   onboarding: $('onboarding'),
   dismissOnboard: $('dismiss-onboard'),
+  pasteWarn: $('paste-warn'),
 };
 
 let CreateWebWorkerMLCEngine = null;
@@ -266,8 +269,13 @@ function populateModelSelect(selectedId) {
     }
   }
   els.modelSelect.replaceChildren(frag);
-  if (prev && [...els.modelSelect.options].some((o) => o.value === prev)) {
-    els.modelSelect.value = prev;
+  if (prev) {
+    for (let i = 0; i < els.modelSelect.options.length; i++) {
+      if (els.modelSelect.options[i].value === prev) {
+        els.modelSelect.value = prev;
+        break;
+      }
+    }
   }
 }
 
@@ -283,7 +291,12 @@ function autoSelectModel() {
     if (low.length) pool = low;
   }
   const pick = pool[Math.min(pool.length - 1, Math.floor(pool.length / 3))] || pool[0];
-  return { ...pick, label: formatModelLabel(pick) };
+  return {
+    model_id: pick.model_id,
+    vram_required_MB: pick.vram_required_MB,
+    low_resource_required: pick.low_resource_required,
+    label: formatModelLabel(pick),
+  };
 }
 
 async function loadModelCatalog() {
@@ -307,7 +320,7 @@ async function loadModelCatalog() {
 }
 
 async function purgeModelCaches(ids) {
-  const list = [...new Set((ids || []).filter(Boolean))];
+  const list = uniqueStrings(ids || []);
   if (!list.length) return;
   try {
     await ensureWebLLM();
@@ -415,20 +428,125 @@ function showBootError(text) {
   els.bootError.textContent = text || '';
 }
 
-function estimateTokens(str) {
-  // Rough heuristic ~4 chars/token — avoids tokenizer stack work on huge pastes
-  return Math.ceil((str || '').length / 4);
+function showPasteWarn(text) {
+  if (!els.pasteWarn) {
+    if (text) showBootError(text);
+    return;
+  }
+  if (!text) {
+    els.pasteWarn.hidden = true;
+    els.pasteWarn.textContent = '';
+    return;
+  }
+  els.pasteWarn.hidden = false;
+  els.pasteWarn.textContent = text;
+}
+
+/** Iterative dedupe — never `[...new Set()]` on large lists. */
+function uniqueStrings(arr) {
+  const seen = Object.create(null);
+  const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (!v || seen[v]) continue;
+    seen[v] = 1;
+    out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Safe paste/send char budget for the active (or selected) model.
+ * Small models (≤~2B / Gemma-class) stay under ~50,005 chars.
+ */
+function getSafeInputCharLimit(modelId) {
+  const id = String(modelId || selectedModelId() || '');
+  const lower = id.toLowerCase();
+  // Explicit small-model band (Gemma 2B, 0.5B–2B, 360M, TinyLlama, etc.)
+  if (
+    /gemma-2b|gemma2-2b|2b-it|360m|0\.5b|1b-|1\.1b|1\.5b|tinyllama|smollm/i.test(lower)
+  ) {
+    return 50_005;
+  }
+  if (/3b|phi-3|phi-3\.5|4b/i.test(lower)) return 80_000;
+  if (/7b|8b|9b/i.test(lower)) return 120_000;
+  // Unknown / larger — still cap to protect the JS stack in WebLLM
+  const vram = modelCatalog.find((m) => m.model_id === id)?.vram_required_MB;
+  if (vram != null && vram <= 2000) return 50_005;
+  if (vram != null && vram <= 4500) return 80_000;
+  return 100_000;
+}
+
+/**
+ * Iterative token estimate — never tokenize, never concatenate giant strings.
+ * ~4 chars/token heuristic, length summed in a loop.
+ */
+function estimateTokensFromLengths(lengths) {
+  let totalChars = 0;
+  for (let i = 0; i < lengths.length; i++) {
+    totalChars += lengths[i] | 0;
+  }
+  return Math.ceil(totalChars / 4);
+}
+
+function sumContentLengths(messages) {
+  let n = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const c = messages[i]?.content;
+    if (typeof c === 'string') n += c.length;
+  }
+  return n;
+}
+
+/**
+ * Split oversized text into manageable segments without recursion.
+ * Prefers breaking on newlines near the limit.
+ */
+function chunkText(text, maxChars) {
+  const src = text == null ? '' : String(text);
+  const limit = Math.max(1024, maxChars | 0);
+  const chunks = [];
+  if (!src.length) return chunks;
+  if (src.length <= limit) {
+    chunks.push(src);
+    return chunks;
+  }
+
+  let start = 0;
+  const len = src.length;
+  while (start < len) {
+    let end = start + limit;
+    if (end >= len) {
+      chunks.push(src.slice(start));
+      break;
+    }
+    // Walk backward for a newline (iterative, bounded)
+    let split = end;
+    const searchFloor = start + Math.floor(limit * 0.6);
+    for (let i = end; i > searchFloor; i--) {
+      const ch = src.charCodeAt(i);
+      if (ch === 10 || ch === 13) {
+        split = i + 1;
+        break;
+      }
+    }
+    chunks.push(src.slice(start, split));
+    start = split;
+  }
+  return chunks;
 }
 
 function updateTokenMeter() {
-  const draft = els.promptInput?.value || '';
-  const hist = chatMessages.map((m) => m.content).join('\n');
-  const sys = els.systemPrompt?.value || '';
-  const chars = draft.length + hist.length + sys.length;
-  const tokens = estimateTokens(draft + hist + sys);
-  if (els.tokenMeterLabel) els.tokenMeterLabel.textContent = `${chars.toLocaleString()} chars · ~${tokens.toLocaleString()} tok`;
-  // Soft visual vs ~32k context
-  const pct = Math.min(100, (tokens / 32000) * 100);
+  const draftLen = els.promptInput?.value?.length || 0;
+  const sysLen = els.systemPrompt?.value?.length || 0;
+  const histLen = sumContentLengths(chatMessages);
+  const chars = draftLen + histLen + sysLen;
+  const tokens = estimateTokensFromLengths([draftLen, histLen, sysLen]);
+  const limit = getSafeInputCharLimit();
+  if (els.tokenMeterLabel) {
+    els.tokenMeterLabel.textContent = `${chars.toLocaleString()} chars · ~${tokens.toLocaleString()} tok · limit ${limit.toLocaleString()}`;
+  }
+  const pct = Math.min(100, (draftLen / limit) * 100);
   if (els.tokenMeterFill) {
     els.tokenMeterFill.style.width = `${pct}%`;
     els.tokenMeterFill.dataset.level = pct > 85 ? 'high' : pct > 55 ? 'mid' : 'ok';
@@ -485,8 +603,21 @@ function renderChatFromMemory() {
   }
 }
 
+function cloneMessages(msgs) {
+  const out = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    out.push({
+      role: m.role,
+      content: m.content,
+      meta: m.meta,
+    });
+  }
+  return out;
+}
+
 function pushUndo() {
-  undoStack.push(chatMessages.map((m) => ({ ...m })));
+  undoStack.push(cloneMessages(chatMessages));
   if (undoStack.length > 40) undoStack.shift();
   redoStack.length = 0;
   syncUndoButtons();
@@ -499,7 +630,7 @@ function syncUndoButtons() {
 
 function undo() {
   if (!undoStack.length) return;
-  redoStack.push(chatMessages.map((m) => ({ ...m })));
+  redoStack.push(cloneMessages(chatMessages));
   chatMessages = undoStack.pop();
   renderChatFromMemory();
   syncUndoButtons();
@@ -508,7 +639,7 @@ function undo() {
 
 function redo() {
   if (!redoStack.length) return;
-  undoStack.push(chatMessages.map((m) => ({ ...m })));
+  undoStack.push(cloneMessages(chatMessages));
   chatMessages = redoStack.pop();
   renderChatFromMemory();
   syncUndoButtons();
@@ -682,12 +813,19 @@ function setComposerEnabled(on) {
   if (els.sendBtn) els.sendBtn.disabled = !on;
 }
 
-function buildMessages() {
+function buildMessages(extraUserContent) {
   const system = els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT;
-  const history = chatMessages
-    .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .map((m) => ({ role: m.role, content: m.content }));
-  return [{ role: 'system', content: system }, ...history];
+  const out = [];
+  out.push({ role: 'system', content: system });
+  for (let i = 0; i < chatMessages.length; i++) {
+    const m = chatMessages[i];
+    if (m.role !== 'user' && m.role !== 'assistant') continue;
+    out.push({ role: m.role, content: m.content });
+  }
+  if (typeof extraUserContent === 'string' && extraUserContent.length) {
+    out.push({ role: 'user', content: extraUserContent });
+  }
+  return out;
 }
 
 /**
@@ -703,20 +841,87 @@ function yieldToMain() {
   });
 }
 
+async function runOneCompletion(messages, onDelta) {
+  const maxTokens = resolveMaxTokens();
+  const temperature = Number(els.temperature?.value || 0.7);
+  const req = {
+    messages,
+    stream: true,
+    temperature,
+    top_p: 0.95,
+  };
+  if (maxTokens != null && maxTokens > 0) req.max_tokens = maxTokens;
+
+  const stream = await engine.chat.completions.create(req);
+  let reply = '';
+  let finishReason = null;
+  let tokenCount = 0;
+  let uiTick = 0;
+
+  for await (const chunk of stream) {
+    const choice = chunk.choices?.[0];
+    const delta = choice?.delta?.content || '';
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    if (!delta) continue;
+    // Iterative concat (engineered string builder via array would also work;
+    // += is fine for stack — avoid recursive reduce)
+    reply += delta;
+    tokenCount += 1;
+    uiTick += 1;
+    if (onDelta && (uiTick % 3 === 0 || delta.length > 40)) {
+      onDelta(reply);
+    }
+  }
+  if (onDelta) onDelta(reply);
+  return { reply, finishReason, tokenCount };
+}
+
 async function sendPrompt(ev) {
   ev?.preventDefault?.();
   if (!booted || !engine || generating) return;
   const query = els.promptInput.value;
   if (!query.trim()) return;
 
+  const limit = getSafeInputCharLimit();
+  showPasteWarn('');
+
+  // Pre-flight: refuse absurd sizes that would crash JS / WebLLM
+  if (query.length > HARD_PASTE_CEILING) {
+    showPasteWarn(
+      `Input is ${query.length.toLocaleString()} characters — over the hard safety ceiling (${HARD_PASTE_CEILING.toLocaleString()}). Please split the file before pasting.`
+    );
+    return;
+  }
+
   pushUndo();
-  // Capture string reference once — do not recursively walk characters
   const payload = query;
   els.promptInput.value = '';
   updateTokenMeter();
 
-  appendMsg('user', payload);
-  chatMessages.push({ role: 'user', content: payload });
+  // Chunk oversized payloads before they hit the model pipeline
+  const parts = chunkText(payload, limit);
+  const multi = parts.length > 1;
+
+  if (multi) {
+    showPasteWarn(
+      `Input is ${payload.length.toLocaleString()} chars (limit ${limit.toLocaleString()} for this model). Auto-splitting into ${parts.length} chunks…`
+    );
+    writeLog(`Chunking payload → ${parts.length} segments @ ≤${limit} chars`, 'warn');
+  }
+
+  appendMsg(
+    'user',
+    multi
+      ? `[${parts.length} chunks · ${payload.length.toLocaleString()} chars]\n\n${payload}`
+      : payload
+  );
+  // Store a compact user marker in history for multi-chunk to avoid re-feeding the full blob
+  chatMessages.push({
+    role: 'user',
+    content: multi
+      ? `(User submitted ${payload.length} characters in ${parts.length} chunks for analysis.)`
+      : payload,
+  });
 
   generating = true;
   els.sendBtn.disabled = true;
@@ -725,77 +930,96 @@ async function sendPrompt(ev) {
 
   const { root, body } = appendMsg('assistant', '');
   root.classList.add('streaming');
-  setStatus('Writing…', 'busy');
+  setStatus(multi ? `Analyzing chunk 1/${parts.length}…` : 'Writing…', 'busy');
 
-  let reply = '';
-  let finishReason = null;
-  let tokenCount = 0;
   const genStart = performance.now();
-  const maxTokens = resolveMaxTokens();
-  const temperature = Number(els.temperature?.value || 0.7);
+  const replyParts = [];
 
   try {
-    await yieldToMain();
-    const req = {
-      messages: buildMessages(),
-      stream: true,
-      temperature,
-      top_p: 0.95,
-    };
-    if (maxTokens != null && maxTokens > 0) req.max_tokens = maxTokens;
+    for (let i = 0; i < parts.length; i++) {
+      if (!generating && i > 0) break;
+      setStatus(`Analyzing chunk ${i + 1}/${parts.length}…`, 'busy');
+      await yieldToMain();
 
-    const chunks = await engine.chat.completions.create(req);
-    let uiTick = 0;
+      const header =
+        parts.length === 1
+          ? parts[i]
+          : `Analyze code chunk ${i + 1} of ${parts.length}. Focus on this segment only; later chunks continue the same file.\n\n\`\`\`\n${parts[i]}\n\`\`\``;
 
-    for await (const chunk of chunks) {
-      const choice = chunk.choices?.[0];
-      const delta = choice?.delta?.content || '';
-      if (choice?.finish_reason) finishReason = choice.finish_reason;
-      if (delta) {
-        reply += delta;
-        tokenCount += 1;
-        // Throttle DOM writes for huge streams (avoids main-thread meltdown)
-        uiTick += 1;
-        if (uiTick % 3 === 0 || delta.length > 40) {
-          if (reply.length > PREVIEW_CHARS) {
-            body.replaceChildren();
-            const pre = document.createElement('pre');
-            pre.className = 'msg-pre';
-            pre.textContent = reply.slice(-PREVIEW_CHARS);
-            body.appendChild(pre);
-          } else {
-            body.textContent = reply;
-          }
-          els.chat.scrollTop = els.chat.scrollHeight;
+      // For multi-chunk, don't re-send the entire chat history blob — lean messages
+      const messages =
+        parts.length === 1
+          ? buildMessages()
+          : [
+              {
+                role: 'system',
+                content: els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT,
+              },
+              { role: 'user', content: header },
+            ];
+
+      const { reply, finishReason } = await runOneCompletion(messages, (partial) => {
+        const shown =
+          parts.length === 1
+            ? partial
+            : replyParts.length
+              ? joinStrings(replyParts) + '\n\n---\n\n' + partial
+              : `### Chunk ${i + 1}/${parts.length}\n\n` + partial;
+        if (shown.length > PREVIEW_CHARS) {
+          body.replaceChildren();
+          const pre = document.createElement('pre');
+          pre.className = 'msg-pre';
+          pre.textContent = shown.slice(-PREVIEW_CHARS);
+          body.appendChild(pre);
+        } else {
+          body.textContent = shown;
         }
-        const elapsed = (performance.now() - genStart) / 1000;
-        if (elapsed > 0 && els.telTps) {
-          els.telTps.textContent = `${(tokenCount / elapsed).toFixed(1)}`;
-        }
+        els.chat.scrollTop = els.chat.scrollHeight;
+      });
+
+      if (parts.length > 1) {
+        replyParts.push(`### Chunk ${i + 1}/${parts.length}\n\n${reply || '(empty)'}`);
+      } else {
+        replyParts.push(reply || '(empty)');
       }
+
+      const elapsed = (performance.now() - genStart) / 1000;
+      if (elapsed > 0 && els.telTps) {
+        els.telTps.textContent = `${(reply.length / Math.max(elapsed, 0.01) / 4).toFixed(1)}`;
+      }
+      void finishReason;
+      await yieldToMain();
     }
 
     root.classList.remove('streaming');
+    const fullReply = joinStrings(replyParts, '\n\n');
     body.replaceChildren();
-    if (reply.length > PREVIEW_CHARS) {
+    if (fullReply.length > PREVIEW_CHARS) {
       const pre = document.createElement('pre');
       pre.className = 'msg-pre';
-      pre.textContent = reply;
+      pre.textContent = fullReply;
       body.appendChild(pre);
     } else {
-      body.textContent = reply || '(empty)';
+      body.textContent = fullReply || '(empty)';
     }
 
     const latencyMs = Math.round(performance.now() - genStart);
     if (els.telLatency) els.telLatency.textContent = `${latencyMs} ms`;
-    const meta = `${finishReason || 'stop'} · ${latencyMs} ms`;
+    const meta = multi
+      ? `${parts.length} chunks · ${latencyMs} ms`
+      : `stop · ${latencyMs} ms`;
     const m = document.createElement('span');
     m.className = 'msg-meta';
     m.textContent = meta;
     root.appendChild(m);
 
-    chatMessages.push({ role: 'assistant', content: reply || '(empty)', meta });
+    chatMessages.push({ role: 'assistant', content: fullReply || '(empty)', meta });
     setStatus('Ready', 'ok');
+    showPasteWarn(
+      multi
+        ? `Finished ${parts.length} chunks safely (limit ${limit.toLocaleString()} chars/chunk).`
+        : ''
+    );
     updateTokenMeter();
   } catch (err) {
     root.classList.remove('streaming');
@@ -804,8 +1028,8 @@ async function sendPrompt(ev) {
     writeLog(msg, 'error');
     setStatus('Error', 'error');
     if (/stack size/i.test(msg)) {
-      showBootError(
-        'Model hit a stack limit on that paste size. Try a smaller model, or split the code into sections.'
+      showPasteWarn(
+        `Stack overflow blocked. Limit is ${limit.toLocaleString()} chars for this model — paste was auto-chunked or rejected. Try fewer lines per paste.`
       );
     }
   } finally {
@@ -815,6 +1039,19 @@ async function sendPrompt(ev) {
     els.promptInput.disabled = false;
     els.promptInput.focus();
   }
+}
+
+/** Iterative string join — no Array#join on pathological cases required, but join is fine; keep explicit. */
+function joinStrings(parts, sep) {
+  if (!parts.length) return '';
+  if (parts.length === 1) return parts[0];
+  const s = sep == null ? '' : sep;
+  let out = parts[0];
+  for (let i = 1; i < parts.length; i++) {
+    out += s;
+    out += parts[i];
+  }
+  return out;
 }
 
 async function abortGen() {
@@ -856,7 +1093,7 @@ function clearChat() {
 }
 
 // ---------------------------------------------------------------------------
-// Paste-safe composer (fixes stack overflow on large pastes)
+// Paste-safe composer — pre-flight size check + no recursive inserts
 // ---------------------------------------------------------------------------
 function installPasteHandler() {
   const ta = els.promptInput;
@@ -865,21 +1102,60 @@ function installPasteHandler() {
   ta.addEventListener('paste', (e) => {
     e.preventDefault();
     const clip = e.clipboardData?.getData('text/plain') ?? '';
-    // Single assignment — no recursive insertNode walks
+    const limit = getSafeInputCharLimit();
     const start = ta.selectionStart ?? ta.value.length;
     const end = ta.selectionEnd ?? ta.value.length;
     const before = ta.value.slice(0, start);
     const after = ta.value.slice(end);
-    ta.value = before + clip + after;
-    const caret = start + clip.length;
-    ta.setSelectionRange(caret, caret);
-    updateTokenMeter();
-    if (els.pasteHint || true) {
+    const projected = before.length + clip.length + after.length;
+
+    if (clip.length > HARD_PASTE_CEILING || projected > HARD_PASTE_CEILING) {
+      showPasteWarn(
+        `Paste blocked: ${clip.length.toLocaleString()} characters exceeds the hard ceiling (${HARD_PASTE_CEILING.toLocaleString()}). Split the file first.`
+      );
+      writeLog('Paste blocked — hard ceiling', 'warn');
+      return;
+    }
+
+    if (clip.length > limit || projected > limit) {
+      // Accept into the composer but warn — send path will auto-chunk
+      showPasteWarn(
+        `Large paste (${clip.length.toLocaleString()} chars). Safe limit for this model is ${limit.toLocaleString()} chars. On Send it will be split into chunks automatically.`
+      );
+      writeLog(
+        `Large paste · ${clip.length.toLocaleString()} chars · limit ${limit.toLocaleString()} — will chunk on send`,
+        'warn'
+      );
+    } else {
+      showPasteWarn('');
       writeLog(`Paste accepted · ${clip.length.toLocaleString()} chars`, 'info');
     }
+
+    // Single assignment — never recursive insertNode / execCommand
+    ta.value = before + clip + after;
+    const caret = Math.min(before.length + clip.length, ta.value.length);
+    try {
+      ta.setSelectionRange(caret, caret);
+    } catch {
+      /* some browsers flaky on huge values */
+    }
+    updateTokenMeter();
   });
 
-  ta.addEventListener('input', () => updateTokenMeter());
+  ta.addEventListener('input', () => {
+    updateTokenMeter();
+    const limit = getSafeInputCharLimit();
+    const n = ta.value.length;
+    if (n > limit) {
+      showPasteWarn(
+        `Composer is ${n.toLocaleString()} chars (model limit ${limit.toLocaleString()}). Sending will auto-chunk.`
+      );
+    } else if (els.pasteWarn && !els.pasteWarn.hidden && n <= limit) {
+      // Clear soft warning once under limit
+      const t = els.pasteWarn.textContent || '';
+      if (/auto-chunk|Large paste|Composer is/i.test(t)) showPasteWarn('');
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

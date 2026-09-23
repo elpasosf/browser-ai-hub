@@ -10,7 +10,7 @@
   <meta property="og:title" content="Browser AI Hub — Incognito Local LLM" />
   <meta property="og:description" content="Zero-storage, on-device chat. Simple or Advanced Engineer mode." />
   <title>Browser AI Hub</title>
-  <link rel="stylesheet" href="style.css?v=8" />
+  <link rel="stylesheet" href="style.css?v=9" />
   <script>
     (function () {
       if ('serviceWorker' in navigator) {
@@ -228,6 +228,7 @@
               placeholder="Start AI, then paste code or ask a question… (Ctrl+Enter to send)"
               disabled
             ></textarea>
+            <p class="error-banner" id="paste-warn" hidden></p>
             <div class="composer-actions">
               <button type="submit" class="btn primary" id="send-btn" disabled>Send</button>
               <button type="button" class="btn ghost" id="abort-btn" disabled>Stop</button>
@@ -267,6 +268,6 @@
     <div id="auditor-list" class="auditor-list"></div>
   </aside>
 
-  <script type="module" src="app.js?v=8"></script>
+  <script type="module" src="app.js?v=9"></script>
 </body>
 </html>
