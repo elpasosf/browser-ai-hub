@@ -9,9 +9,13 @@ Be concrete and complete. Prefer working code over vague advice. Use fenced code
 Assume the user is working on their own machine and projects, and wants practical implementation help. Match the user's language and keep answers focused on the task. Stay concise unless they ask for depth or long-form writing.`;
 
 const MAX_LOG = 200;
-const MAX_HISTORY = 12;
 
-const LENGTH_TOKENS = { short: 256, normal: 1024, long: 2048 };
+const LENGTH_TOKENS = {
+  short: 256,
+  normal: 1024,
+  long: 2048,
+  unlimited: null, // no app-side cap
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -67,9 +71,10 @@ let prebuiltAppConfig = null;
 let ModelType = null;
 let webllmReady = null;
 
-/** @type {Array<{model_id:string,vram_required_MB?:number,low_resource_required?:boolean,model_type?:number}>} */
+/** @type {Array<{model_id:string,vram_required_MB:number|null,low_resource_required:boolean}>} */
 let modelCatalog = [];
 let catalogLoaded = false;
+let catalogLoading = null;
 
 let engine = null;
 let booted = false;
@@ -100,10 +105,6 @@ async function ensureWebLLM() {
   return webllmReady;
 }
 
-function catalogIds() {
-  return modelCatalog.map((m) => m.model_id);
-}
-
 function isChatModel(rec) {
   const t = rec.model_type;
   if (t != null) {
@@ -116,6 +117,15 @@ function isChatModel(rec) {
   return true;
 }
 
+function toLeanRecord(rec) {
+  // Never keep / spread full WebLLM records (nested integrity/config can blow the stack)
+  return {
+    model_id: String(rec.model_id || ''),
+    vram_required_MB: Number.isFinite(rec.vram_required_MB) ? rec.vram_required_MB : null,
+    low_resource_required: !!rec.low_resource_required,
+  };
+}
+
 function formatModelLabel(rec) {
   const id = rec.model_id;
   const vram = rec.vram_required_MB;
@@ -124,82 +134,77 @@ function formatModelLabel(rec) {
   return `${id}${vramTxt}${low}`;
 }
 
-function estimateVramBudgetMB() {
-  // Browser can't read dedicated VRAM reliably; use deviceMemory as a soft budget.
-  const memGB = navigator.deviceMemory || 8;
-  const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-  if (mobile) return 1200;
-  // Leave headroom for browser + KV cache
-  return Math.round(memGB * 350);
-}
-
 function populateModelSelect(selectedId) {
   if (!els.modelSelect) return;
   const prev = selectedId || els.modelSelect.value;
-  els.modelSelect.innerHTML = '';
+  const frag = document.createDocumentFragment();
   if (!modelCatalog.length) {
     const opt = document.createElement('option');
     opt.value = '';
     opt.textContent = catalogLoaded ? 'No chat models found' : 'Loading model list…';
-    els.modelSelect.appendChild(opt);
-    return;
+    frag.appendChild(opt);
+  } else {
+    for (const rec of modelCatalog) {
+      const opt = document.createElement('option');
+      opt.value = rec.model_id;
+      opt.textContent = formatModelLabel(rec);
+      frag.appendChild(opt);
+    }
   }
-  for (const rec of modelCatalog) {
-    const opt = document.createElement('option');
-    opt.value = rec.model_id;
-    opt.textContent = formatModelLabel(rec);
-    els.modelSelect.appendChild(opt);
-  }
+  els.modelSelect.replaceChildren(frag);
   if (prev && [...els.modelSelect.options].some((o) => o.value === prev)) {
     els.modelSelect.value = prev;
   }
 }
 
 async function loadModelCatalog() {
-  await ensureWebLLM();
-  const list = prebuiltAppConfig?.model_list || [];
-  modelCatalog = list
-    .filter(isChatModel)
-    .slice()
-    .sort((a, b) => (a.vram_required_MB || 9e9) - (b.vram_required_MB || 9e9));
-  catalogLoaded = true;
-  populateModelSelect(autoSelectModel()?.model_id);
-  syncAutoLabels();
-  writeLog(`Model catalog loaded · ${modelCatalog.length} chat models from WebLLM`, 'success');
-  return modelCatalog;
+  if (catalogLoading) return catalogLoading;
+  catalogLoading = (async () => {
+    await ensureWebLLM();
+    const list = prebuiltAppConfig?.model_list || [];
+    modelCatalog = list.filter(isChatModel).map(toLeanRecord).filter((m) => m.model_id);
+    modelCatalog.sort((a, b) => (a.vram_required_MB ?? 9e9) - (b.vram_required_MB ?? 9e9));
+    catalogLoaded = true;
+    const pick = autoSelectModel();
+    populateModelSelect(pick.model_id);
+    syncAutoLabels();
+    writeLog(`Model catalog loaded · ${modelCatalog.length} chat models from WebLLM`, 'success');
+    return modelCatalog;
+  })().finally(() => {
+    catalogLoading = null;
+  });
+  return catalogLoading;
 }
 
 /**
- * Auto-pick: largest chat model that fits estimated VRAM budget.
- * Uses WebLLM metadata (vram_required_MB / low_resource_required) — not a hardcoded ID list.
+ * Soft auto-pick only — every catalog model stays selectable in Manual.
+ * Prefers low-resource on small devices; otherwise a mid-size model.
  */
 function autoSelectModel() {
   if (!modelCatalog.length) {
     return { model_id: '', label: 'Loading catalog…', vram_required_MB: null };
   }
-  const budget = estimateVramBudgetMB();
   const mobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-  let pool = modelCatalog.filter((m) => (m.vram_required_MB || 0) <= budget);
-  if (mobile || (navigator.deviceMemory || 8) <= 4) {
+  const memGB = navigator.deviceMemory || 8;
+  let pool = modelCatalog.slice();
+  if (mobile || memGB <= 4) {
     const low = pool.filter((m) => m.low_resource_required);
     if (low.length) pool = low;
   }
-  if (!pool.length) {
-    // Fallback: smallest model in catalog
-    pool = [modelCatalog[0]];
-  }
-  // Prefer the strongest (highest VRAM) that still fits
-  pool.sort((a, b) => (b.vram_required_MB || 0) - (a.vram_required_MB || 0));
-  const pick = pool[0];
+  // Mid-index = balanced default (no hard VRAM rejection)
+  const pick = pool[Math.min(pool.length - 1, Math.floor(pool.length / 3))] || pool[0];
   return {
-    ...pick,
+    model_id: pick.model_id,
     id: pick.model_id,
+    vram_required_MB: pick.vram_required_MB,
+    low_resource_required: pick.low_resource_required,
     label: formatModelLabel(pick),
   };
 }
 
 async function purgeModelCaches(modelIds) {
-  const ids = modelIds?.length ? modelIds : catalogIds();
+  // Only delete explicitly listed IDs — never walk the whole catalog (was blowing up)
+  const ids = [...new Set((modelIds || []).filter(Boolean))];
   if (!ids.length) return;
   if (!deleteModelAllInfoInCache || !prebuiltAppConfig) {
     try {
@@ -208,20 +213,12 @@ async function purgeModelCaches(modelIds) {
       return;
     }
   }
-  for (const id of [...new Set(ids.filter(Boolean))]) {
+  for (const id of ids) {
     try {
       await deleteModelAllInfoInCache(id, prebuiltAppConfig);
     } catch {
       /* ignore */
     }
-  }
-  try {
-    const keys = await caches.keys();
-    await Promise.all(
-      keys.filter((k) => /bah-|webllm|mlc|web-ai|browser-ai|shell/i.test(k)).map((k) => caches.delete(k))
-    );
-  } catch {
-    /* ignore */
   }
 }
 
@@ -245,9 +242,7 @@ async function purgeSessionArtifacts() {
     }
     booted = false;
     generating = false;
-    await purgeModelCaches(
-      activeModelId ? [activeModelId, ...catalogIds()] : catalogIds()
-    );
+    await purgeModelCaches(activeModelId ? [activeModelId] : []);
     activeModelId = null;
   } finally {
     purging = false;
@@ -328,7 +323,10 @@ function appendMsg(role, text, meta) {
 function resolveMaxTokens() {
   const override = Number(els.maxTokensOverride?.value || 0);
   if (override > 0) return override;
-  return LENGTH_TOKENS[els.lengthSelect?.value || 'normal'] || 1024;
+  const key = els.lengthSelect?.value || 'unlimited';
+  return Object.prototype.hasOwnProperty.call(LENGTH_TOKENS, key)
+    ? LENGTH_TOKENS[key]
+    : null;
 }
 
 function syncAutoLabels() {
@@ -342,12 +340,15 @@ function syncAutoLabels() {
     short: 'Short (~256 tokens)',
     normal: 'Normal (~1024 tokens)',
     long: 'Long (~2048 tokens)',
+    unlimited: 'Unlimited (model context)',
   };
+  const lenKey = els.lengthSelect?.value || 'unlimited';
   if (els.autoLengthLabel) {
-    els.autoLengthLabel.textContent = labels[els.lengthSelect?.value || 'normal'];
+    els.autoLengthLabel.textContent = labels[lenKey] || labels.unlimited;
   }
   if (els.autoCacheLabel) els.autoCacheLabel.textContent = 'None · session only';
-  if (els.oom) els.oom.textContent = `${resolveMaxTokens()} tokens`;
+  const cap = resolveMaxTokens();
+  if (els.oom) els.oom.textContent = cap == null ? 'Unlimited' : `${cap} tokens`;
   if ((els.configMode?.value || 'auto') === 'auto' && els.modelSelect && rec.model_id) {
     els.modelSelect.value = rec.model_id;
   }
@@ -526,9 +527,9 @@ async function loadLLM() {
 
 function buildMessages() {
   const system = els.systemPrompt?.value.trim() || DEFAULT_SYSTEM_PROMPT;
+  // No artificial history trim — model context window is the only bound
   const history = chatMessages
     .filter((m) => m.role === 'user' || m.role === 'assistant')
-    .slice(-MAX_HISTORY)
     .map((m) => ({ role: m.role, content: m.content }));
   return [{ role: 'system', content: system }, ...history];
 }
@@ -558,13 +559,18 @@ async function sendPrompt(ev) {
   const maxTokens = resolveMaxTokens();
 
   try {
-    const chunks = await engine.chat.completions.create({
+    const req = {
       messages: buildMessages(),
       stream: true,
-      max_tokens: maxTokens,
       temperature: 0.7,
       top_p: 0.95,
-    });
+    };
+    // Only set max_tokens when the user chose a cap
+    if (maxTokens != null && maxTokens > 0) {
+      req.max_tokens = maxTokens;
+    }
+
+    const chunks = await engine.chat.completions.create(req);
 
     for await (const chunk of chunks) {
       const choice = chunk.choices?.[0];
@@ -584,7 +590,7 @@ async function sendPrompt(ev) {
 
     bubble.classList.remove('streaming');
     if (finishReason === 'length') {
-      writeLog(`Hit length limit (${maxTokens}). Switch to Long or type “continue”.`, 'warn');
+      writeLog('Model hit its own context/length stop. Type “continue” to keep going.', 'warn');
     }
 
     const latencyMs = Math.round(performance.now() - genStart);
@@ -595,7 +601,7 @@ async function sendPrompt(ev) {
     bubble.textContent = reply || '(empty)';
     const meta =
       finishReason === 'length'
-        ? `Cut off at ${maxTokens} tokens — choose Long or type “continue”`
+        ? `Stopped by model context · type “continue” · ${tps} tok/s`
         : `${finishReason || 'stop'} · ${latencyMs} ms · ${tps} tok/s`;
     const m = document.createElement('span');
     m.className = 'msg-meta';
@@ -606,9 +612,11 @@ async function sendPrompt(ev) {
     setStatus('Ready', 'ok');
   } catch (err) {
     bubble.classList.remove('streaming');
-    bubble.textContent = `Error: ${err.message || err}`;
-    writeLog(`Inference error: ${err.message || err}`, 'error');
+    const msg = err?.message || String(err);
+    bubble.textContent = `Error: ${msg}`;
+    writeLog(`Inference error: ${msg}`, 'error');
     setStatus('Error', 'error');
+    showBootError(msg.includes('stack') ? 'Model crashed (stack overflow). Pick a smaller model in Advanced → Manual.' : '');
   } finally {
     generating = false;
     els.abortBtn.disabled = true;

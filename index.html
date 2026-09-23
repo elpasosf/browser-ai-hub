@@ -12,7 +12,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="preconnect" href="https://esm.run" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=6" />
+  <link rel="stylesheet" href="style.css?v=7" />
   <script>
     // Kill stale service workers + caches immediately (fixes mixed old/new UI)
     (function () {
@@ -75,7 +75,7 @@
             </div>
             <div class="auto-row">
               <span>Reply length</span>
-              <strong id="auto-length-label">Normal (~1024 tokens)</strong>
+              <strong id="auto-length-label">Unlimited (model context)</strong>
             </div>
             <div class="auto-row">
               <span>Storage</span>
@@ -85,9 +85,10 @@
           <label class="field">
             <span>How long should answers be?</span>
             <select id="length-select">
-              <option value="short">Short — quick answers</option>
-              <option value="normal" selected>Normal — paragraphs &amp; short essays</option>
-              <option value="long">Long — multi-page writing</option>
+              <option value="unlimited" selected>Unlimited — use full model context</option>
+              <option value="short">Short — ~256 tokens</option>
+              <option value="normal">Normal — ~1024 tokens</option>
+              <option value="long">Long — ~2048 tokens</option>
             </select>
           </label>
           <div class="btn-stack">
@@ -116,7 +117,7 @@
               <div class="spec"><span class="spec-k">CPU</span><span class="spec-v" id="spec-threads">—</span></div>
               <div class="spec"><span class="spec-k">Memory</span><span class="spec-v" id="spec-memory">—</span></div>
               <div class="spec"><span class="spec-k">WebGPU</span><span class="spec-v" id="spec-gpu">Detecting…</span></div>
-              <div class="spec"><span class="spec-k">Max tokens</span><span class="spec-v" id="spec-oom">—</span></div>
+              <div class="spec"><span class="spec-k">Reply cap</span><span class="spec-v" id="spec-oom">—</span></div>
             </div>
           </section>
 
@@ -174,11 +175,13 @@ Assume the user is working on their own machine and projects, and wants practica
             <label class="field">
               <span>Max tokens override</span>
               <select id="max-tokens-override">
-                <option value="0" selected>Use reply-length setting</option>
+                <option value="0" selected>No override (use reply-length)</option>
                 <option value="256">256</option>
                 <option value="512">512</option>
                 <option value="1024">1024</option>
                 <option value="2048">2048</option>
+                <option value="4096">4096</option>
+                <option value="8192">8192</option>
               </select>
             </label>
             <button type="button" class="btn danger" id="clear-cache-btn">Erase session</button>
@@ -216,6 +219,6 @@ Assume the user is working on their own machine and projects, and wants practica
     </main>
   </div>
 
-  <script type="module" src="app.js?v=6"></script>
+  <script type="module" src="app.js?v=7"></script>
 </body>
 </html>
